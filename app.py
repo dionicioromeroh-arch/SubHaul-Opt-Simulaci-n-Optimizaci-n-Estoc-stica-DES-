@@ -1102,7 +1102,12 @@ with tab3:
         b2.metric("Impacto Anual", f"${cres['delta_net_usd_anio']:+,.2f} /año", f"{g.guardias_anio} guardias", delta_color="off")
 
         b3, b4 = st.columns(2)
-        b3.metric("Mann-Whitney U (p)", f"{cres['test_net']['mannwhitney_p']:.5f}", "Significativo (p<0.05)" if sig else "No significativo", delta_color="off")
+        b3.metric(
+            "Mann-Whitney U (p)",
+            f"{cres['test_net']['mannwhitney_p']:.5f}",
+            "Significativo (p<0.05)" if cres["test_net"]["mannwhitney_p"] < 0.05 else "No significativo",
+            delta_color="off",
+        )
         b4.metric("CO2 Evitado vs. Fijo", f"{cres['abet_comparison']['co2_avoided_t_anio']:+.2f} t/año", f"Diésel: {cres['abet_comparison']['diesel_saved_l_anio']:+.0f} L/año", delta_color="off")
 
         st.dataframe(cres["comparison_table"], use_container_width=True, hide_index=True)
