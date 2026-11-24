@@ -20,6 +20,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
+import streamlit.components.v1 as components
 
 from motor_des import (
     POLICY_LABELS,
@@ -43,6 +44,7 @@ from optimizador import (
     optimize_fleet_and_assignment,
     run_replications,
 )
+from visualizador_2d import build_2d_comparison_html, build_2d_viewer_html
 
 # ==============================================================================
 # CONFIGURACIÓN DE PÁGINA, ESQUEMA CANÓNICO DE 9 RUTAS Y ESTADO DE SESIÓN
@@ -76,6 +78,13 @@ def _policy_fmt(code: str) -> str:
     return POLICY_LABELS.get(code, code)
 
 
+def _fmt_hm(hours: float) -> str:
+    """Formatea horas decimales a texto legible de ingeniería (ej. '8 h 14 min (8.23 h)')."""
+    total_min = int(round(max(0.0, float(hours)) * 60.0))
+    hh, mm = divmod(total_min, 60)
+    return f"{hh} h {mm:02d} min ({hours:.2f} h)"
+
+
 def _config_matches_current_schema(cfg: object) -> bool:
     """Verifica que una configuración en session_state posea el esquema vigente de 9 rutas."""
     zones = getattr(cfg, "zones", None)
@@ -94,9 +103,10 @@ def _init_state() -> None:
         st.session_state.comp_res = None
         st.session_state.bench_res = None
         st.session_state.resil_res = None
+        st.session_state.sim2d_res = None
     if "cfg_version" not in st.session_state:
         st.session_state.cfg_version = 0
-    for key in ("dash_res", "opt_res", "comp_res", "bench_res", "resil_res"):
+    for key in ("dash_res", "opt_res", "comp_res", "bench_res", "resil_res", "sim2d_res"):
         if key not in st.session_state:
             st.session_state[key] = None
 
@@ -111,6 +121,7 @@ def _load_new_config(cfg: SimulationConfig) -> None:
     st.session_state.comp_res = None
     st.session_state.bench_res = None
     st.session_state.resil_res = None
+    st.session_state.sim2d_res = None
 
 
 def _template_bytes(cfg: SimulationConfig) -> bytes:
@@ -749,22 +760,41 @@ if route_validation_errors:
 
 
 # ==============================================================================
-# PESTAÑAS PRINCIPALES (4 MÓDULOS DEL BRIEF)
+# PESTAÑAS PRINCIPALES (5 MÓDULOS)
 # ==============================================================================
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "📊 1. Dashboard Ejecutivo y Colas",
     "🎯 2. Optimizador Sim-Opt",
     "📈 3. Fijo vs. Dinámico, Benchmark y Resiliencia",
     "🌱 4. Evaluación ABET y Reporte Excel",
+    "🎬 5. Simulación 2D",
 ])
 
 # ------------------------------------------------------------------------------
 # PESTAÑA 1: DASHBOARD EJECUTIVO Y COLAS
 # ------------------------------------------------------------------------------
 with tab1:
-    col_run1, col_run2, col_info = st.columns([1.2, 1.4, 2.4])
-    run_single = col_run1.button("▶️ Simular 1 Guardia (Semilla)", type="primary", use_container_width=True)
-    run_mc = col_run2.button(f"🎲 Simular {g.num_replicas} Réplicas (IC {int(g.nivel_confianza*100)}%)", use_container_width=True)
+    col_seed, col_run1, col_run2, col_info = st.columns([0.85, 1.15, 1.45, 2.35])
+    dash_seed = int(
+        col_seed.number_input(
+            "Semilla (1 guardia)",
+            min_value=0,
+            max_value=999999,
+            value=int(g.semilla),
+            step=1,
+            key=f"dash_seed_{v}",
+        )
+    )
+    with col_run1:
+        st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
+        run_single = st.button("▶️ Simular 1 Guardia", use_container_width=True)
+    with col_run2:
+        st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
+        run_mc = st.button(
+            f"🎲 Simular {g.num_replicas} Réplicas (IC {int(g.nivel_confianza*100)}%)",
+            type="primary",
+            use_container_width=True,
+        )
     active_z = [z for z in cfg.zones if z.active]
 
     if (
@@ -773,8 +803,9 @@ with tab1:
         or st.session_state.dash_res is None
         or "df_stations" not in st.session_state.dash_res
         or "fleet_op_cost_usd" not in st.session_state.dash_res["kpi"]
+        or "time_to_target_hr" not in st.session_state.dash_res["kpi"]
     ):
-        eng = SubHaulDESEngine(cfg, seed_override=g.semilla)
+        eng = SubHaulDESEngine(cfg, seed_override=int(dash_seed))
         kpi_one = eng.run()
         mc_res = run_replications(cfg, n_replicas=g.num_replicas, base_seed=1) if run_mc else None
         st.session_state.dash_res = {
@@ -860,6 +891,45 @@ with tab1:
     k5.metric("Tiempo Total en Cola", f"{wait_val:.3f} h/gdia", wait_sub, delta_color="off")
     k6.metric("Ventilación Q (D.S. 023)", f"{q_vent:,.0f} m³/min", f"{q_vent*35.3147:,.0f} CFM", delta_color="off")
 
+    # Cuadro destacado de Tiempo de Cumplimiento de Meta Diaria
+    if g.meta_mineral_gdia > 0.0:
+        if mc is None:
+            ttt_hr = kpi.get("time_to_target_hr")
+            if ttt_hr is not None:
+                margen_min = (nom_hr - float(ttt_hr)) * 60.0
+                st.success(
+                    f"⏱️ Cumplimiento de Meta ({g.meta_mineral_gdia:,.0f} t/gdia) — "
+                    f"Política: {_policy_fmt(g.politica_despacho)} (Semilla {kpi['seed']}): "
+                    f"meta alcanzada en **{_fmt_hm(float(ttt_hr))}** "
+                    f"(margen restante sobre guardia nominal: {margen_min:.0f} min)."
+                )
+            else:
+                deficit_tn = max(0.0, g.meta_mineral_gdia - float(kpi["ore_total_tn"]))
+                st.warning(
+                    f"⚠️ Cumplimiento de Meta ({g.meta_mineral_gdia:,.0f} t/gdia) — "
+                    f"Política: {_policy_fmt(g.politica_despacho)} (Semilla {kpi['seed']}): "
+                    f"la meta no fue alcanzada en la guardia (producción final: {kpi['ore_total_tn']:,.2f} t; "
+                    f"déficit: {deficit_tn:,.2f} t)."
+                )
+        else:
+            ttt_ci = mc.get("time_to_target_hr")
+            if ttt_ci is not None:
+                ttt_mean = float(ttt_ci["mean"])
+                ttt_ci_min = float(ttt_ci["ci_half"]) * 60.0
+                st.success(
+                    f"⏱️ Tiempo promedio a Meta ({g.meta_mineral_gdia:,.0f} t/gdia) — "
+                    f"Política: {_policy_fmt(g.politica_despacho)} ({mc['n_replicas']} réplicas): "
+                    f"**{_fmt_hm(ttt_mean)} ± {ttt_ci_min:.1f} min** "
+                    f"(meta alcanzada en {mc['n_replicas_target_met']}/{mc['n_replicas']} réplicas · "
+                    f"{mc['prob_target_met_pct']:.1f}%)."
+                )
+            else:
+                st.warning(
+                    f"⚠️ Cumplimiento de Meta ({g.meta_mineral_gdia:,.0f} t/gdia) — "
+                    f"Política: {_policy_fmt(g.politica_despacho)}: "
+                    f"la meta no fue alcanzada en ninguna de las {mc['n_replicas']} réplicas "
+                    f"(promedio: {mc['ore_tn']['mean']:,.2f} t/gdia)."
+                )
     # Banner automático si es escenario de validación histórica (12 volquetes)
     if kpi["n_trucks_total"] == 12 and g.politica_despacho == "FIJA":
         aprox = (1.0 - abs(1200.0 - kpi["ore_total_tn"]) / 1200.0) * 100.0
@@ -1319,3 +1389,180 @@ with tab4:
         type="primary",
         use_container_width=True,
     )
+
+
+# ------------------------------------------------------------------------------
+# PESTAÑA 5: SIMULACIÓN VISUAL 2D (HTML5 CANVAS)
+# ------------------------------------------------------------------------------
+with tab5:
+    st.subheader("🎬 Simulación Visual 2D de Flota y Despacho en Tiempo Real")
+    st.caption(
+        "Hereda automáticamente la flota, zonas, cuotas, tarifas, infraestructura, corte de guardia y falla What-If "
+        "del Panel de Control y del Editor en Vivo. Usa la misma semilla para verificar paridad exacta con la Pestaña 1."
+    )
+
+    VIEW_MODES_2D = [
+        "Vista individual (1 política)",
+        "Comparativo lado a lado (Fija vs. Dinámica)",
+    ]
+
+    s2d_c1, s2d_c2, s2d_c3, s2d_c4 = st.columns([1.45, 1.55, 0.9, 1.35])
+    view_mode_2d = s2d_c1.selectbox(
+        "Modo de vista",
+        VIEW_MODES_2D,
+        index=0,
+        key=f"sim2d_mode_{v}",
+    )
+    is_compare_2d = view_mode_2d == VIEW_MODES_2D[1]
+
+    if is_compare_2d:
+        default_dyn_2d_idx = (
+            DYNAMIC_POLICY_OPTIONS.index(g.politica_despacho)
+            if g.politica_despacho in DYNAMIC_POLICY_OPTIONS
+            else 0
+        )
+        pol_2d = s2d_c2.selectbox(
+            "Política dinámica (vs. Fija)",
+            DYNAMIC_POLICY_OPTIONS,
+            index=default_dyn_2d_idx,
+            format_func=_policy_fmt,
+            key=f"sim2d_pol_cmp_{v}",
+        )
+    else:
+        pol_2d = s2d_c2.selectbox(
+            "Política a animar",
+            POLICY_OPTIONS,
+            index=POLICY_OPTIONS.index(g.politica_despacho) if g.politica_despacho in POLICY_OPTIONS else 0,
+            format_func=_policy_fmt,
+            key=f"sim2d_pol_single_{v}",
+        )
+
+    seed_2d = int(
+        s2d_c3.number_input(
+            "Semilla de guardia",
+            min_value=0,
+            max_value=999999,
+            value=int(g.semilla),
+            step=1,
+            key=f"sim2d_seed_{v}",
+        )
+    )
+
+    with s2d_c4:
+        st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
+        run_2d = st.button(
+            "🎬 Generar / Actualizar Simulación 2D",
+            type="primary",
+            use_container_width=True,
+            key=f"sim2d_run_{v}",
+        )
+
+    if run_2d or st.session_state.sim2d_res is None:
+        with st.spinner("Generando trazado de eventos DES para animación 2D..."):
+            if is_compare_2d:
+                cfg_left = cfg.clone()
+                cfg_left.global_cfg.politica_despacho = "FIJA"
+                eng_left = SubHaulDESEngine(cfg_left, seed_override=seed_2d, record_trace=True)
+                kpi_left = eng_left.run()
+                trace_left = eng_left.get_trace_payload()
+
+                cfg_right = cfg.clone()
+                cfg_right.global_cfg.politica_despacho = pol_2d
+                eng_right = SubHaulDESEngine(cfg_right, seed_override=seed_2d, record_trace=True)
+                kpi_right = eng_right.run()
+                trace_right = eng_right.get_trace_payload()
+
+                viewer_h = 560
+                html_2d = build_2d_comparison_html(trace_left, trace_right, height=viewer_h)
+                st.session_state.sim2d_res = {
+                    "mode": "COMPARE",
+                    "seed": seed_2d,
+                    "policy_left": "FIJA",
+                    "policy_right": pol_2d,
+                    "kpi_left": kpi_left,
+                    "kpi_right": kpi_right,
+                    "n_redirs_left": len(trace_left.get("redirections", [])),
+                    "n_redirs_right": len(trace_right.get("redirections", [])),
+                    "html": html_2d,
+                    "iframe_height": viewer_h + 32,
+                }
+            else:
+                cfg_2d = cfg.clone()
+                cfg_2d.global_cfg.politica_despacho = pol_2d
+                eng_2d = SubHaulDESEngine(cfg_2d, seed_override=seed_2d, record_trace=True)
+                kpi_2d = eng_2d.run()
+                trace_2d = eng_2d.get_trace_payload()
+
+                viewer_h = 640
+                html_2d = build_2d_viewer_html(trace_2d, height=viewer_h)
+                st.session_state.sim2d_res = {
+                    "mode": "SINGLE",
+                    "seed": seed_2d,
+                    "policy": pol_2d,
+                    "kpi": kpi_2d,
+                    "n_redirs": len(trace_2d.get("redirections", [])),
+                    "html": html_2d,
+                    "iframe_height": viewer_h + 8,
+                }
+
+    s2d = st.session_state.sim2d_res
+    if s2d is not None:
+        if s2d["mode"] == "COMPARE":
+            kl = s2d["kpi_left"]
+            kr = s2d["kpi_right"]
+            d_ore = float(kr["ore_total_tn"]) - float(kl["ore_total_tn"])
+            d_net = float(kr["net_revenue_usd"]) - float(kl["net_revenue_usd"])
+            d_wait = float(kr["total_truck_wait_hr"]) - float(kl["total_truck_wait_hr"])
+
+            m2d_1, m2d_2, m2d_3, m2d_4 = st.columns(4)
+            m2d_1.metric(
+                "Mineral (Din. vs. Fija)",
+                f"{kr['ore_total_tn']:,.2f} t/gdia",
+                f"{d_ore:+.2f} t vs. Fija ({kl['ore_total_tn']:,.2f} t)",
+            )
+            m2d_2.metric(
+                "Ingreso Neto (Din. vs. Fija)",
+                f"${kr['net_revenue_usd']:,.2f} /gdia",
+                f"${d_net:+,.2f} vs. Fija",
+            )
+            m2d_3.metric(
+                "Tiempo en Cola (Din. vs. Fija)",
+                f"{kr['total_truck_wait_hr']:.3f} h/gdia",
+                f"{d_wait:+.3f} h vs. Fija ({kl['total_truck_wait_hr']:.3f} h)",
+                delta_color="inverse",
+            )
+            m2d_4.metric(
+                "N° Redirecciones Dinámicas",
+                f"{s2d['n_redirs_right']}",
+                f"Fija: {s2d['n_redirs_left']} | Semilla: {s2d['seed']}",
+                delta_color="off",
+            )
+        else:
+            k2d = s2d["kpi"]
+            m2d_1, m2d_2, m2d_3, m2d_4 = st.columns(4)
+            m2d_1.metric(
+                "Mineral Total",
+                f"{k2d['ore_total_tn']:,.2f} t/gdia",
+                f"Desmonte: {k2d['waste_total_tn']:,.2f} t",
+                delta_color="off",
+            )
+            m2d_2.metric(
+                "Ingreso Neto",
+                f"${k2d['net_revenue_usd']:,.2f} /gdia",
+                f"OPEX: ${k2d['total_opex_usd']:,.2f}",
+                delta_color="off",
+            )
+            m2d_3.metric(
+                "Tiempo Total en Cola",
+                f"{k2d['total_truck_wait_hr']:.3f} h/gdia",
+                f"Fu Volquetes: {k2d['truck_fu'] * 100:.1f}%",
+                delta_color="off",
+            )
+            m2d_4.metric(
+                "N° Redirecciones Dinámicas",
+                f"{s2d['n_redirs']}",
+                f"Semilla: {s2d['seed']} | {_policy_fmt(s2d['policy'])}",
+                delta_color="off",
+            )
+
+        components.html(s2d["html"], height=int(s2d["iframe_height"]), scrolling=False)

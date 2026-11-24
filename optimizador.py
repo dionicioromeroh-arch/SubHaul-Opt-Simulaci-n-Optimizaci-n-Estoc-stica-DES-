@@ -199,6 +199,8 @@ def run_replications(
             "scale_utilization": float(kpi["scale_utilization"]),
             "truck_fu": float(kpi["truck_fu"]),
             "target_met": bool(kpi["target_met"]),
+            "time_to_target_sec": kpi.get("time_to_target_sec"),
+            "time_to_target_hr": kpi.get("time_to_target_hr"),
         }
         for zid in zone_ids:
             row[f"ore_{zid}"] = kpi["ore_by_zone"][zid]
@@ -218,6 +220,8 @@ def run_replications(
     wait_ci = compute_mean_ci(df_rep["total_truck_wait_hr"], conf)
     fu_ci = compute_mean_ci(df_rep["truck_fu"], conf)
     horizon_hr_ci = compute_mean_ci(df_rep["effective_horizon_hr"], conf)
+    valid_ttt = df_rep["time_to_target_hr"].dropna().astype(float).tolist()
+    time_to_target_hr_ci = compute_mean_ci(valid_ttt, conf) if len(valid_ttt) > 0 else None
 
     ore_zone_means = {zid: round(float(df_rep[f"ore_{zid}"].mean()), 2) for zid in zone_ids}
     util_zone_means = {zid: round(float(df_rep[f"util_{zid}"].mean()), 4) for zid in zone_ids}
@@ -266,6 +270,8 @@ def run_replications(
         "truck_fu": fu_ci,
         "prob_target_met_pct": round(float(df_rep["target_met"].mean() * 100.0), 2),
         "target_met_mean": ore_ci["mean"] >= g.meta_mineral_gdia,
+        "time_to_target_hr": time_to_target_hr_ci,
+        "n_replicas_target_met": len(valid_ttt),
         "ore_by_zone_mean": ore_zone_means,
         "scoop_util_by_zone_mean": util_zone_means,
         "max_queue_by_zone_mean": max_q_zone_means,

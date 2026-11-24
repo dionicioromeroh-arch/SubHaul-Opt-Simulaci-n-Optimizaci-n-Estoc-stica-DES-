@@ -23,12 +23,15 @@ Características clave:
   SOFT (permite culminar descarga a volquetes en tránsito).
 - Contingencias de falla (What-If programada o estocástica MTBF/MTTR) con
   simpy.PriorityResource sin contaminar la utilización productiva.
+- Registro opcional de eventos (`record_trace=True`) serializable a JSON para
+  animación 2D sin alterar RNG ni KPIs.
 - Exportación e importación completa desde plantilla Excel (.xlsx).
 """
 
 from __future__ import annotations
 
 import copy
+import json
 import math
 import random
 from dataclasses import dataclass, field
@@ -513,6 +516,7 @@ class SubHaulDESEngine:
         self,
         config: SimulationConfig,
         seed_override: Optional[int] = None,
+        record_trace: bool = False,
         **_legacy_kwargs: object,
     ):
         # _legacy_kwargs ignora limpiamente parámetros obsoletos (ej. costo_op_volquete_hora)
@@ -525,6 +529,15 @@ class SubHaulDESEngine:
         self.rng = random.Random(self.seed)
         # RNG separado para fallas estocásticas MTBF/MTTR (no altera secuencia base de ciclos)
         self.rng_fail = random.Random(self.seed + 100_003)
+
+        self.record_trace: bool = bool(record_trace)
+        self.trace: Dict[str, List[Dict[str, object]]] = {
+            "travels": [],
+            "stations": [],
+            "dumps": [],
+            "breakdowns": [],
+            "redirections": [],
+        }
 
         self.env = simpy.Environment()
         self.sim_time = float(self.g.sim_time_sec)
@@ -560,6 +573,7 @@ class SubHaulDESEngine:
         self.waste_by_zone: Dict[str, float] = {z.zone_id: 0.0 for z in self.active_zones}
         self.trips_ore_by_zone: Dict[str, int] = {z.zone_id: 0 for z in self.active_zones}
         self.trips_waste_by_zone: Dict[str, int] = {z.zone_id: 0 for z in self.active_zones}
+        self.time_to_target_sec: Optional[float] = None
 
         # Partición exclusiva de tiempo en volquetes: productivo (HM) vs. cola/standby
         self.zone_truck_wait_sec: Dict[str, float] = {z.zone_id: 0.0 for z in self.active_zones}
@@ -695,7 +709,17 @@ class SubHaulDESEngine:
         except ValueError as exc:
             raise KeyError(f"Distribución '{key}' no encontrada en SimulationConfig.distributions.") from exc
 
-    def travel_segments(self, segments: Sequence[str], zone_for_prod: Optional[str] = None):
+    def travel_segments(
+        self,
+        segments: Sequence[str],
+        zone_for_prod: Optional[str] = None,
+        truck_id: Optional[int] = None,
+        role: Optional[str] = None,
+        zone_id: Optional[str] = None,
+        load_state: str = "EMPTY",
+        redirected: bool = False,
+        prev_zone_id: Optional[str] = None,
+    ):
         """Ejecuta secuencialmente una lista de tramos de viaje y registra tiempo productivo."""
         for raw_seg in segments:
             for seg in str(raw_seg).split("|"):
@@ -705,6 +729,18 @@ class SubHaulDESEngine:
                 dt = self.sample_ref(seg)
                 if dt > 0.0:
                     t0 = self.env.now
+                    if self.record_trace and role is not None and truck_id is not None:
+                        self.trace["travels"].append({
+                            "truck_id": int(truck_id),
+                            "t0": round(t0, 2),
+                            "t1": round(t0 + dt, 2),
+                            "seg_key": seg,
+                            "role": role,
+                            "zone_id": zone_id if zone_id is not None else zone_for_prod,
+                            "load_state": load_state,
+                            "redirected": bool(redirected),
+                            "prev_zone_id": prev_zone_id,
+                        })
                     yield self.env.timeout(dt)
                     elapsed = self.env.now - t0
                     self.total_truck_productive_sec += elapsed
@@ -717,6 +753,7 @@ class SubHaulDESEngine:
         truck_id: int,
         service_ref: Union[str, float],
         zone_for_wait: Optional[str] = None,
+        load_state: str = "EMPTY",
     ):
         """
         Secuencia QUEUE -> SEIZE (PriorityResource) -> DEPART -> ADVANCE -> RELEASE.
@@ -725,6 +762,20 @@ class SubHaulDESEngine:
         """
         st = self.stations[station_key]
         t_arr = st.enter_queue()
+
+        trace_ev: Optional[Dict[str, object]] = None
+        if self.record_trace:
+            trace_ev = {
+                "truck_id": int(truck_id),
+                "station_key": station_key,
+                "t_enter_q": round(t_arr, 2),
+                "t_start_svc": None,
+                "t_end_svc": None,
+                "zone_id": zone_for_wait if zone_for_wait is not None else station_key,
+                "load_state": load_state,
+            }
+            self.trace["stations"].append(trace_ev)
+
         req = st.resource.request(priority=StationMonitor.PRIORITY_TRUCK)
         yield req
 
@@ -737,6 +788,10 @@ class SubHaulDESEngine:
 
         service_time = self.sample_ref(service_ref)
         t0 = self.env.now
+        if trace_ev is not None:
+            trace_ev["t_start_svc"] = round(t0, 2)
+            trace_ev["t_end_svc"] = round(t0 + service_time, 2)
+
         if service_time > 0.0:
             yield self.env.timeout(service_time)
         elapsed = self.env.now - t0
@@ -746,6 +801,7 @@ class SubHaulDESEngine:
 
         st.release_facility()
         st.resource.release(req)
+        return elapsed
 
     # --------------------------------------------------------------------------
     # Procesos de contingencia / falla de equipos (simpy.PriorityResource)
@@ -759,6 +815,13 @@ class SubHaulDESEngine:
         req = st.resource.request(priority=StationMonitor.PRIORITY_BREAKDOWN)
         yield req
         st.start_breakdown_unit()
+        if self.record_trace:
+            t_start = self.env.now
+            self.trace["breakdowns"].append({
+                "station_key": station_key,
+                "t_start": round(t_start, 2),
+                "t_end": round(t_start + duration_sec, 2),
+            })
         yield self.env.timeout(duration_sec)
         st.end_breakdown_unit()
         st.resource.release(req)
@@ -780,6 +843,13 @@ class SubHaulDESEngine:
             req = st.resource.request(priority=StationMonitor.PRIORITY_BREAKDOWN)
             yield req
             st.start_breakdown_unit()
+            if self.record_trace:
+                t_start = self.env.now
+                self.trace["breakdowns"].append({
+                    "station_key": bd.station_key,
+                    "t_start": round(t_start, 2),
+                    "t_end": round(t_start + ttr, 2),
+                })
             yield self.env.timeout(ttr)
             st.end_breakdown_unit()
             st.resource.release(req)
@@ -900,6 +970,8 @@ class SubHaulDESEngine:
     def truck_process(self, truck_id: int, initial_zone_id: str, entry_delay: float):
         yield self.env.timeout(entry_delay)
         current_zone_id = initial_zone_id
+        prev_zone_for_bajada: Optional[str] = None
+        redirected_for_bajada: bool = False
         soft_stop = (self.g.modo_parada.strip().upper() == "SOFT")
         is_predictive = (self.policy in PREDICTIVE_POLICIES)
 
@@ -913,7 +985,14 @@ class SubHaulDESEngine:
 
         # 1. Traslado inicial: Estacionamiento -> Bocamina[A]
         yield from self.travel_segments(
-            self.zone_map[current_zone_id].dist_inicial, zone_for_prod=current_zone_id
+            self.zone_map[current_zone_id].dist_inicial,
+            zone_for_prod=current_zone_id,
+            truck_id=truck_id,
+            role="inicial",
+            zone_id=current_zone_id,
+            load_state="EMPTY",
+            redirected=False,
+            prev_zone_id=None,
         )
 
         # 2. Bucle de ciclos operativos durante la guardia
@@ -922,7 +1001,16 @@ class SubHaulDESEngine:
 
             # --- IDA (vinculada a zona origen A) ---
             # Bocamina[A] -> Cámara de carguío[A] (vacío)
-            yield from self.travel_segments(z.dist_bajada_vacio, zone_for_prod=z.zone_id)
+            yield from self.travel_segments(
+                z.dist_bajada_vacio,
+                zone_for_prod=z.zone_id,
+                truck_id=truck_id,
+                role="bajada",
+                zone_id=z.zone_id,
+                load_state="EMPTY",
+                redirected=redirected_for_bajada,
+                prev_zone_id=prev_zone_for_bajada,
+            )
 
             # El volquete arribó a la cámara: sale de la lista en tránsito antes de entrar a cola
             if is_predictive and my_eta_entry is not None:
@@ -931,58 +1019,133 @@ class SubHaulDESEngine:
                 my_eta_entry = None
 
             # Cola y Carguío en cámara[A]
-            yield from self.use_station(z.zone_id, truck_id, z.dist_carguio, zone_for_wait=z.zone_id)
+            yield from self.use_station(
+                z.zone_id, truck_id, z.dist_carguio, zone_for_wait=z.zone_id, load_state="EMPTY"
+            )
 
             # Decisión probabilística mineral vs. desmonte
             is_mineral = (self.rng.random() <= z.prob_mineral)
+            mat_state = "ORE" if is_mineral else "WASTE"
 
             # Cámara de carguío[A] -> Bocamina[A] (cargado)
-            yield from self.travel_segments(z.dist_subida_cargado, zone_for_prod=z.zone_id)
+            yield from self.travel_segments(
+                z.dist_subida_cargado,
+                zone_for_prod=z.zone_id,
+                truck_id=truck_id,
+                role="subida",
+                zone_id=z.zone_id,
+                load_state=mat_state,
+                redirected=False,
+                prev_zone_id=z.zone_id,
+            )
 
             if is_mineral:
                 # Bocamina[A] -> Balanza -> Cancha de mineral -> Descarga mineral
-                yield from self.travel_segments(z.dist_hacia_balanza, zone_for_prod=z.zone_id)
+                yield from self.travel_segments(
+                    z.dist_hacia_balanza,
+                    zone_for_prod=z.zone_id,
+                    truck_id=truck_id,
+                    role="hacia_balanza",
+                    zone_id=z.zone_id,
+                    load_state="ORE",
+                    redirected=False,
+                    prev_zone_id=z.zone_id,
+                )
                 if self.g.num_balanzas > 0:
                     t_ini = self.env.now
-                    yield from self.use_station("BAL", truck_id, self.g.dist_balanza, zone_for_wait=z.zone_id)
+                    yield from self.use_station(
+                        "BAL", truck_id, self.g.dist_balanza, zone_for_wait=z.zone_id, load_state="ORE"
+                    )
                     self.zone_scale_sec[z.zone_id] += self.env.now - t_ini
                     self.zone_scale_cnt[z.zone_id] += 1
-                yield from self.travel_segments(z.dist_balanza_a_cancha, zone_for_prod=z.zone_id)
+                yield from self.travel_segments(
+                    z.dist_balanza_a_cancha,
+                    zone_for_prod=z.zone_id,
+                    truck_id=truck_id,
+                    role="balanza_a_cancha",
+                    zone_id=z.zone_id,
+                    load_state="ORE",
+                    redirected=False,
+                    prev_zone_id=z.zone_id,
+                )
 
                 t_ini = self.env.now
                 if self.g.cap_descarga_mineral > 0:
-                    yield from self.use_station(
-                        "DUMP_ORE", truck_id, self.g.dist_descarga_mineral, zone_for_wait=z.zone_id
+                    dump_svc_sec = yield from self.use_station(
+                        "DUMP_ORE",
+                        truck_id,
+                        self.g.dist_descarga_mineral,
+                        zone_for_wait=z.zone_id,
+                        load_state="ORE",
                     )
                 else:
                     yield from self.travel_segments([self.g.dist_descarga_mineral], zone_for_prod=z.zone_id)
+                    dump_svc_sec = self.env.now - t_ini
                 self.zone_dump_ore_sec[z.zone_id] += self.env.now - t_ini
                 self.zone_dump_ore_cnt[z.zone_id] += 1
 
                 ore_dist = z.ore_tonnage_dist or self.g.dist_tonelaje_mineral
                 ton = self.sample_ref(ore_dist)
                 self.ore_by_zone[z.zone_id] += ton
+                if (
+                    self.time_to_target_sec is None
+                    and self.g.meta_mineral_gdia > 0.0
+                    and sum(self.ore_by_zone.values()) >= self.g.meta_mineral_gdia
+                ):
+                    self.time_to_target_sec = float(self.env.now)
                 self.trips_ore_by_zone[z.zone_id] += 1
                 if self.effective_plant_cap_tn > 0 and self.capped_ore_tn < self.effective_plant_cap_tn:
                     self.capped_ore_tn += ton
                     self.capped_gross_revenue_usd += ton * z.ore_price_usd_tn
+                if self.record_trace:
+                    self.trace["dumps"].append({
+                        "t": round(self.env.now, 2),
+                        "truck_id": int(truck_id),
+                        "zone_id": z.zone_id,
+                        "material": "ORE",
+                        "tons": round(ton, 3),
+                        "dump_duration_sec": round(dump_svc_sec, 2),
+                    })
             else:
                 # Bocamina[A] -> Desmontera -> Descarga desmonte
-                yield from self.travel_segments(z.dist_hacia_desmontera, zone_for_prod=z.zone_id)
+                yield from self.travel_segments(
+                    z.dist_hacia_desmontera,
+                    zone_for_prod=z.zone_id,
+                    truck_id=truck_id,
+                    role="hacia_desmontera",
+                    zone_id=z.zone_id,
+                    load_state="WASTE",
+                    redirected=False,
+                    prev_zone_id=z.zone_id,
+                )
 
                 t_ini = self.env.now
                 if self.g.cap_descarga_desmonte > 0:
-                    yield from self.use_station(
-                        "DUMP_WASTE", truck_id, self.g.dist_descarga_desmonte, zone_for_wait=z.zone_id
+                    dump_svc_sec = yield from self.use_station(
+                        "DUMP_WASTE",
+                        truck_id,
+                        self.g.dist_descarga_desmonte,
+                        zone_for_wait=z.zone_id,
+                        load_state="WASTE",
                     )
                 else:
                     yield from self.travel_segments([self.g.dist_descarga_desmonte], zone_for_prod=z.zone_id)
+                    dump_svc_sec = self.env.now - t_ini
                 self.zone_dump_waste_sec[z.zone_id] += self.env.now - t_ini
                 self.zone_dump_waste_cnt[z.zone_id] += 1
 
                 ton_w = self.sample_ref(z.waste_tonnage_dist)
                 self.waste_by_zone[z.zone_id] += ton_w
                 self.trips_waste_by_zone[z.zone_id] += 1
+                if self.record_trace:
+                    self.trace["dumps"].append({
+                        "t": round(self.env.now, 2),
+                        "truck_id": int(truck_id),
+                        "zone_id": z.zone_id,
+                        "material": "WASTE",
+                        "tons": round(ton_w, 3),
+                        "dump_duration_sec": round(dump_svc_sec, 2),
+                    })
 
             # --- DESVINCULACIÓN Y DECISIÓN TRAS DESCARGAR ---
             if is_predictive:
@@ -1002,17 +1165,43 @@ class SubHaulDESEngine:
             else:
                 next_zone_id = self.choose_next_zone_reactive()
 
+            was_redirected = (next_zone_id != current_zone_id)
+            if self.record_trace and was_redirected:
+                self.trace["redirections"].append({
+                    "t": round(self.env.now, 2),
+                    "truck_id": int(truck_id),
+                    "from_zone": current_zone_id,
+                    "to_zone": next_zone_id,
+                    "dump_point": "CANCHA_MIN" if is_mineral else "DESMONTERA",
+                })
+
             # --- RETORNO (vinculado EXCLUSIVAMENTE a la zona destino B) ---
             next_z = self.zone_map[next_zone_id]
             if is_mineral:
                 yield from self.travel_segments(
-                    next_z.dist_retorno_desde_mineral, zone_for_prod=next_zone_id
+                    next_z.dist_retorno_desde_mineral,
+                    zone_for_prod=next_zone_id,
+                    truck_id=truck_id,
+                    role="retorno_min",
+                    zone_id=next_zone_id,
+                    load_state="EMPTY",
+                    redirected=was_redirected,
+                    prev_zone_id=current_zone_id,
                 )
             else:
                 yield from self.travel_segments(
-                    next_z.dist_retorno_desde_desmonte, zone_for_prod=next_zone_id
+                    next_z.dist_retorno_desde_desmonte,
+                    zone_for_prod=next_zone_id,
+                    truck_id=truck_id,
+                    role="retorno_desm",
+                    zone_id=next_zone_id,
+                    load_state="EMPTY",
+                    redirected=was_redirected,
+                    prev_zone_id=current_zone_id,
                 )
 
+            prev_zone_for_bajada = current_zone_id
+            redirected_for_bajada = was_redirected
             current_zone_id = next_zone_id
 
     # --------------------------------------------------------------------------
@@ -1054,6 +1243,57 @@ class SubHaulDESEngine:
             st.finalize_at_horizon(self.effective_horizon)
 
         return self.get_summary_kpis()
+
+    # --------------------------------------------------------------------------
+    # Payload de eventos (trace) serializable a JSON para visualización 2D
+    # --------------------------------------------------------------------------
+    def get_trace_payload(self) -> Dict[str, object]:
+        """
+        Retorna un diccionario ligero y 100% serializable con `json.dumps(...)`
+        conteniendo metadatos del escenario, KPIs de verificación y listas de eventos.
+        """
+        kpis = self.get_summary_kpis()
+        return {
+            "policy": str(self.policy),
+            "policy_label": str(POLICY_LABELS.get(self.policy, self.policy)),
+            "stop_mode": str(self.g.modo_parada),
+            "sim_time_sec": float(self.sim_time),
+            "effective_horizon_sec": float(self.effective_horizon),
+            "seed": int(self.seed),
+            "n_trucks_total": int(self.n_trucks_total),
+            "num_balanzas": int(self.g.num_balanzas),
+            "zones": [
+                {
+                    "id": str(z.zone_id),
+                    "name": str(z.zone_name),
+                    "n_trucks": int(z.n_trucks),
+                    "n_scoops": int(z.n_scoops),
+                    "quota_mineral_tn": float(z.quota_mineral_tn),
+                    "exp_bajada_sec": round(float(self.exp_bajada.get(z.zone_id, 0.0)), 2),
+                }
+                for z in self.active_zones
+            ],
+            "kpi_summary": {
+                "ore_total_tn": float(kpis["ore_total_tn"]),
+                "capped_ore_tn": float(kpis["capped_ore_tn"]),
+                "waste_total_tn": float(kpis["waste_total_tn"]),
+                "total_material_tn": float(kpis["total_material_tn"]),
+                "ore_by_zone": {str(k): float(v) for k, v in kpis["ore_by_zone"].items()},
+                "waste_by_zone": {str(k): float(v) for k, v in kpis["waste_by_zone"].items()},
+                "target_met": bool(kpis["target_met"]),
+                "gross_revenue_usd": float(kpis["gross_revenue_usd"]),
+                "total_opex_usd": float(kpis["total_opex_usd"]),
+                "net_revenue_usd": float(kpis["net_revenue_usd"]),
+                "unit_cost_usd_tn": float(kpis["unit_cost_usd_tn"]),
+                "total_truck_wait_hr": float(kpis["total_truck_wait_hr"]),
+                "truck_fu": float(kpis["truck_fu"]),
+            },
+            "travels": self.trace["travels"],
+            "stations": self.trace["stations"],
+            "dumps": self.trace["dumps"],
+            "breakdowns": self.trace["breakdowns"],
+            "redirections": self.trace["redirections"],
+        }
 
     # --------------------------------------------------------------------------
     # Reportes y KPIs estructurados (Estaciones + Económicos + Entrada para ABET)
@@ -1379,6 +1619,8 @@ class SubHaulDESEngine:
             "ore_by_zone": {k: round(v, 4) for k, v in self.ore_by_zone.items()},
             "waste_by_zone": {k: round(v, 4) for k, v in self.waste_by_zone.items()},
             "target_met": ore_total >= self.g.meta_mineral_gdia,
+            "time_to_target_sec": round(self.time_to_target_sec, 2) if self.time_to_target_sec is not None else None,
+            "time_to_target_hr": round(self.time_to_target_sec / 3600.0, 4) if self.time_to_target_sec is not None else None,
             "gross_revenue_usd": round(gross_rev, 2),
             "scoop_op_cost_usd": round(scoop_op_cost, 2),
             "scoop_idle_cost_usd": round(scoop_idle_cost, 2),
@@ -1900,7 +2142,7 @@ def load_config_from_excel(filepath: Union[str, Path]) -> SimulationConfig:
 
 
 # ==============================================================================
-# 8. BATERÍA DE AUTOVERIFICACIÓN (FÍSICA + AUDITORÍA DE COSTOS + EXCEL + TOPE)
+# 8. BATERÍA DE AUTOVERIFICACIÓN (FÍSICA + AUDITORÍA DE COSTOS + EXCEL + TRACE)
 # ==============================================================================
 if __name__ == "__main__":
     pd.set_option("display.max_columns", None)
@@ -1991,3 +2233,45 @@ if __name__ == "__main__":
     assert 1500.0 <= kpi_cap["capped_ore_tn"] < 1530.0
     assert abs(kpi_cap["net_revenue_usd"] - (kpi_cap["gross_revenue_usd"] - kpi_cap["total_opex_usd"])) < 0.02
     print("OK: Excel y tope discreto de planta validados.")
+
+    print("\n" + "=" * 105)
+    print(" 4. PARIDAD DE TRACE (record_trace=True vs False) Y SERIALIZACIÓN JSON")
+    print("=" * 105)
+    eng_val_trace = SubHaulDESEngine(cfg_val.clone(), record_trace=True)
+    kpi_val_trace = eng_val_trace.run()
+    assert kpi_val_trace["ore_total_tn"] == kpi_val["ore_total_tn"], (
+        f"Paridad ore_total_tn alterada (FIJA): {kpi_val_trace['ore_total_tn']} vs {kpi_val['ore_total_tn']}"
+    )
+    assert kpi_val_trace["net_revenue_usd"] == kpi_val["net_revenue_usd"], (
+        f"Paridad net_revenue_usd alterada (FIJA): {kpi_val_trace['net_revenue_usd']} vs {kpi_val['net_revenue_usd']}"
+    )
+    assert len(eng_val_trace.trace["redirections"]) == 0, "Política FIJA no debe generar redirecciones."
+
+    eng_aud_trace = SubHaulDESEngine(cfg_aud.clone(), record_trace=True)
+    kpi_aud_trace = eng_aud_trace.run()
+    assert kpi_aud_trace["ore_total_tn"] == kpi_aud["ore_total_tn"], (
+        f"Paridad ore_total_tn alterada (DIN): {kpi_aud_trace['ore_total_tn']} vs {kpi_aud['ore_total_tn']}"
+    )
+    assert kpi_aud_trace["net_revenue_usd"] == kpi_aud["net_revenue_usd"], (
+        f"Paridad net_revenue_usd alterada (DIN): {kpi_aud_trace['net_revenue_usd']} vs {kpi_aud['net_revenue_usd']}"
+    )
+
+    payload = eng_aud_trace.get_trace_payload()
+    payload_json = json.dumps(payload, ensure_ascii=False)
+    assert len(payload["travels"]) > 0
+    assert len(payload["stations"]) > 0
+    assert len(payload["dumps"]) > 0
+    assert len(payload["redirections"]) > 0
+    print(
+        f"Paridad 100% verificada (FIJA={kpi_val_trace['ore_total_tn']:.2f} t | "
+        f"DIN={kpi_aud_trace['ore_total_tn']:.2f} t, Neto=${kpi_aud_trace['net_revenue_usd']:,.2f})"
+    )
+    print(
+        f"Eventos grabados (DIN_ETA_RITMO, seed=25) | JSON: {len(payload_json) / 1024.0:.1f} KB\n"
+        f"  - travels     : {len(payload['travels'])}\n"
+        f"  - stations    : {len(payload['stations'])}\n"
+        f"  - dumps       : {len(payload['dumps'])}\n"
+        f"  - breakdowns  : {len(payload['breakdowns'])}\n"
+        f"  - redirections: {len(payload['redirections'])}"
+    )
+    print("OK: Trace 2D validado y serializable a JSON sin errores.")
