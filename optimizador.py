@@ -983,19 +983,6 @@ def compare_optimal_fixed_vs_dynamic(
         min_zone_quota_pct=min_zone_quota_pct,
         base_seed=seed0,
     )
-    opt_dyn = optimize_fleet_and_assignment(
-        config,
-        fleet_min=fleet_size,
-        fleet_max=fleet_size,
-        policy=pol_dyn,
-        objective=objective,
-        n_replicas_screen=n_replicas_screen,
-        n_replicas_confirm=max(10, n_replicas_confirm // 2),
-        top_k_confirm=3,
-        require_target_met=True,
-        min_zone_quota_pct=min_zone_quota_pct,
-        base_seed=seed0,
-    )
 
     comp = compare_policies_statistically(
         config,

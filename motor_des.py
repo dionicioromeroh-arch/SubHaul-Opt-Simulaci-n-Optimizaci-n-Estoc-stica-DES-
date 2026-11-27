@@ -343,7 +343,7 @@ class GlobalConfig:
     modo_parada: str = "HARD"                   # HARD (corte exacto) o SOFT (termina ciclo)
     avoid_down_zones: bool = True               # Internalizado siempre en True (desvío obligatorio ante fallas)
     semilla: int = 25
-    num_replicas: int = 30
+    num_replicas: int = 120
     nivel_confianza: float = 0.95
 
     # Infraestructura superficie

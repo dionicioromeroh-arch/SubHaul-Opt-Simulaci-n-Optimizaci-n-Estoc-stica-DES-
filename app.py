@@ -654,7 +654,17 @@ with st.sidebar:
 
     # 4. Montecarlo y Estadística (control único y funcional de semilla)
     with st.expander("🎲 Montecarlo y Estadística", expanded=True):
-        g.num_replicas = int(st.number_input("Réplicas Montecarlo", 2, 200, int(g.num_replicas), 5, key=f"nrep_{v}"))
+        g.num_replicas = int(
+            st.number_input(
+                "Réplicas Montecarlo",
+                min_value=2,
+                max_value=300,
+                value=min(300, max(2, int(g.num_replicas))),
+                step=5,
+                key=f"nrep_{v}",
+                help="Controla exclusivamente el botón de simulación Montecarlo en la Pestaña 1 (Dashboard Ejecutivo).",
+            )
+        )
         seed_widget_key = f"seed_{v}"
         if seed_widget_key not in st.session_state:
             st.session_state[seed_widget_key] = int(g.semilla)
@@ -1212,7 +1222,7 @@ with tab2:
         oc6.number_input(
             "Réplicas Screening (Etapa 1)",
             min_value=2,
-            max_value=100,
+            max_value=300,
             value=15,
             step=1,
             key="simopt_replicas_screen",
@@ -1222,7 +1232,7 @@ with tab2:
         oc7.number_input(
             "Réplicas Confirmación (Etapa 2)",
             min_value=5,
-            max_value=100,
+            max_value=300,
             value=30,
             step=5,
             key="simopt_replicas_confirm",
@@ -1375,7 +1385,7 @@ with tab2:
 # ------------------------------------------------------------------------------
 with tab3:
     st.subheader("A. Contraste Estadístico Formal (1 vs. 1): Despacho Fijo vs. Dinámico")
-    cc1, cc2, cc3, cc4 = st.columns(4)
+    cc1, cc2 = st.columns(2)
     comp_mode = cc1.selectbox("Tipo de contraste", ["Flota actual: Fijo vs. Dinámico", "Mejor Fijo vs. Mejor Dinámico (Justo)"])
     default_dyn_idx = DYNAMIC_POLICY_OPTIONS.index(g.politica_despacho) if g.politica_despacho in DYNAMIC_POLICY_OPTIONS else 0
     alt_pol = cc2.selectbox(
@@ -1384,17 +1394,41 @@ with tab3:
         index=default_dyn_idx,
         format_func=_policy_fmt,
     )
-    comp_reps = int(cc3.number_input("Réplicas estadísticas", 10, 100, int(g.num_replicas), 5))
-    comp_q_pct = cc4.slider("Cuota mín. zona (%) [Modo Justo]", 0, 100, 90, 5, key="comp_q")
 
-    screen_reps_sync = int(st.session_state.get("simopt_replicas_screen", 15))
-    confirm_reps_sync = int(st.session_state.get("simopt_replicas_confirm", 30))
     if "Justo" in comp_mode:
-        st.caption(
-            f"🔗 **Modo Justo sincronizado con Pestaña 2 (Sim-Opt):** búsqueda exhaustiva con "
-            f"**{screen_reps_sync} réplicas de screening** por asignación y "
-            f"**{confirm_reps_sync} réplicas de confirmación** para el Top 3 y el contraste final "
-            f"(el campo *Réplicas estadísticas* aplica a *Flota actual* y al *Benchmark CRN*)."
+        cr1, cr2, cr3 = st.columns(3)
+        comp_screen_3a = int(
+            cr1.number_input(
+                "Réplicas Screening (3.A)",
+                min_value=2,
+                max_value=300,
+                value=15,
+                step=1,
+                key="comp_screen_3a",
+            )
+        )
+        comp_confirm_3a = int(
+            cr2.number_input(
+                "Réplicas Confirmación (3.A)",
+                min_value=5,
+                max_value=300,
+                value=30,
+                step=5,
+                key="comp_confirm_3a",
+            )
+        )
+        comp_q_pct = cr3.slider("Cuota mín. zona (%) [Modo Justo]", 0, 100, 90, 5, key="comp_q")
+    else:
+        cr1, _ = st.columns([1, 2])
+        comp_reps_3a = int(
+            cr1.number_input(
+                "Réplicas estadísticas (3.A)",
+                min_value=10,
+                max_value=300,
+                value=30,
+                step=5,
+                key="comp_reps_3a",
+            )
         )
 
     if st.button("⚖️ Ejecutar Contraste Estadístico (t-Student & Mann-Whitney U)", type="primary"):
@@ -1406,8 +1440,8 @@ with tab3:
                     fleet_size=fleet_n,
                     policy_dynamic=alt_pol,
                     objective=g.funcion_objetivo,
-                    n_replicas_screen=screen_reps_sync,
-                    n_replicas_confirm=confirm_reps_sync,
+                    n_replicas_screen=comp_screen_3a,
+                    n_replicas_confirm=comp_confirm_3a,
                     min_zone_quota_pct=float(comp_q_pct),
                     base_seed=int(g.semilla),
                 )
@@ -1416,7 +1450,7 @@ with tab3:
                     cfg,
                     policy_base="FIJA",
                     policy_alt=alt_pol,
-                    n_replicas=comp_reps,
+                    n_replicas=comp_reps_3a,
                     base_seed=int(g.semilla),
                 )
 
@@ -1465,12 +1499,27 @@ with tab3:
         "Evalúa en simultáneo la Asignación Fija, la Dinámica Reactiva (Caso Base) y las 3 técnicas predictivas "
         "sobre la flota actual usando exactamente las mismas semillas aleatorias."
     )
-    if st.button("🏁 Comparar Todas las Políticas en Simultáneo (Benchmark CRN)"):
-        with st.spinner(f"Ejecutando benchmark de 5 políticas × {comp_reps} réplicas..."):
+    b3_c1, b3_c2 = st.columns([1.2, 2.8])
+    bench_reps_3b = int(
+        b3_c1.number_input(
+            "Réplicas Benchmark CRN (3.B)",
+            min_value=10,
+            max_value=300,
+            value=30,
+            step=5,
+            key="bench_reps_3b",
+        )
+    )
+    with b3_c2:
+        st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
+        run_bench_3b = st.button("🏁 Comparar Todas las Políticas en Simultáneo (Benchmark CRN)")
+
+    if run_bench_3b:
+        with st.spinner(f"Ejecutando benchmark de 5 políticas × {bench_reps_3b} réplicas..."):
             st.session_state.bench_res = benchmark_all_policies(
                 cfg,
                 policies=("FIJA", "DIN_REACTIVA", "DIN_TIEMPO_TOTAL", "DIN_ETA_ESPERA", "DIN_ETA_RITMO"),
-                n_replicas=comp_reps,
+                n_replicas=bench_reps_3b,
                 base_seed=int(g.semilla),
             )
 
@@ -1521,8 +1570,23 @@ with tab3:
         f"Contingencia configurada en barra lateral: parada en **{fail_zone}** desde minuto **{fail_start:.0f}** "
         f"por **{fail_dur:.0f} min** (desvío dinámico automático siempre activo)."
     )
-    if st.button("🚨 Evaluar Resiliencia (Normal vs. Falla por Política)"):
-        with st.spinner("Simulando escenarios con y sin falla de scooptram en las 5 políticas..."):
+    r3_c1, r3_c2 = st.columns([1.2, 2.8])
+    resil_reps_3c = int(
+        r3_c1.number_input(
+            "Réplicas Resiliencia (3.C)",
+            min_value=10,
+            max_value=300,
+            value=25,
+            step=5,
+            key="resil_reps_3c",
+        )
+    )
+    with r3_c2:
+        st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
+        run_resil_3c = st.button("🚨 Evaluar Resiliencia (Normal vs. Falla por Política)")
+
+    if run_resil_3c:
+        with st.spinner(f"Simulando escenarios con y sin falla de scooptram en las 5 políticas ({resil_reps_3c} réplicas)..."):
             bd_eval = BreakdownConfig(
                 event_id=f"FALLA_{fail_zone}",
                 station_key=fail_zone,
@@ -1536,7 +1600,7 @@ with tab3:
                 cfg,
                 breakdown=bd_eval,
                 policies=("FIJA", "DIN_REACTIVA", "DIN_TIEMPO_TOTAL", "DIN_ETA_ESPERA", "DIN_ETA_RITMO"),
-                n_replicas=max(10, min(25, g.num_replicas)),
+                n_replicas=resil_reps_3c,
                 base_seed=int(g.semilla),
             )
 
