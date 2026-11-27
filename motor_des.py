@@ -15,10 +15,19 @@ Características clave:
     * DIN_ETA_ESPERA   : Dinámica: ETA Menor Espera (predictiva post-descarga)
     * DIN_TIEMPO_TOTAL : Dinámica: Menor Tiempo Total (Viaje + Cola, post-descarga)
     * DIN_REACTIVA     : Dinámica: Reactiva (Caso Base post-descarga)
+- Desvío automático incondicional ante zonas completamente detenidas por falla
+  mecánica (con fallback de seguridad únicamente si todas las zonas caen).
 - Modelo económico unificado por estado del equipo (Opción A: Horas Máquina
   Productivas vs. Horas Standby/Cola, con partición exclusiva de tiempo y cero
-  doble conteo).
-- Tope configurable de capacidad de planta remunerada (corte discreto viaje por viaje).
+  doble conteo; tarifas base 50 / 30 / 160 / 90 US$/h).
+- Tope configurable de capacidad de planta remunerada con corte exacto en el
+  viaje de cruce y valoración por NSR de la zona de origen.
+- Sincronización automática de la meta diaria con la suma de cuotas activas por zona.
+- Ventilación normativa D.S. 023-2017-EM calculada sobre el pico simultáneo local
+  de volquetes en interior mina por zona (Fu = 1.0, sin factor reductor Dm) y
+  topes de capacidad de ventilación por zona/circuito.
+- Combustible diésel y emisiones de CO2 desperdiciados estrictamente acotados a
+  las horas en cola de volquetes (excluyendo tiempo idle de scooptrams).
 - Corte de fin de guardia configurable: HARD (corte exacto en sim_time) y
   SOFT (permite culminar descarga a volquetes en tránsito).
 - Contingencias de falla (What-If programada o estocástica MTBF/MTTR) con
@@ -69,6 +78,8 @@ _LEGACY_POLICY_MAP: Dict[str, str] = {
     "DINAMICA": "DIN_ETA_ESPERA",
     "HIBRIDA": "DIN_ETA_RITMO",
 }
+
+M3_MIN_TO_CFM: float = 35.3146667
 
 
 def normalize_policy(policy: str) -> str:
@@ -260,20 +271,21 @@ class ZoneConfig:
     entry_interval_sec: float = 240.0
     # 9 parámetros de ruta anclados en la bocamina/acceso de la zona
     # (soportan claves separadas por '|' y constantes numéricas en segundos, incluido 0)
-    dist_inicial: List[str] = field(default_factory=list)                 # Estacionamiento -> Bocamina
-    dist_bajada_vacio: List[str] = field(default_factory=list)            # Bocamina -> Cámara de carguío
-    dist_carguio: str = "0"                                               # Carguío en cámara
-    dist_subida_cargado: List[str] = field(default_factory=list)          # Cámara de carguío -> Bocamina
-    dist_hacia_balanza: List[str] = field(default_factory=list)           # Bocamina -> Balanza (mineral)
-    dist_balanza_a_cancha: List[str] = field(default_factory=list)        # Balanza -> Cancha mineral (0 sin balanza)
-    dist_hacia_desmontera: List[str] = field(default_factory=list)        # Bocamina -> Desmontera (desmonte)
-    dist_retorno_desde_mineral: List[str] = field(default_factory=list)   # Cancha mineral -> Bocamina (vacío)
-    dist_retorno_desde_desmonte: List[str] = field(default_factory=list)  # Desmontera -> Bocamina (vacío)
+    dist_inicial: List[str] = field(default_factory=list)                 # Estacionamiento -> Bocamina (superficie)
+    dist_bajada_vacio: List[str] = field(default_factory=list)            # Bocamina -> Cámara de carguío (interior mina)
+    dist_carguio: str = "0"                                               # Carguío en cámara (interior mina)
+    dist_subida_cargado: List[str] = field(default_factory=list)          # Cámara de carguío -> Bocamina (interior mina)
+    dist_hacia_balanza: List[str] = field(default_factory=list)           # Bocamina -> Balanza (superficie, mineral)
+    dist_balanza_a_cancha: List[str] = field(default_factory=list)        # Balanza -> Cancha mineral (superficie, 0 sin balanza)
+    dist_hacia_desmontera: List[str] = field(default_factory=list)        # Bocamina -> Desmontera (superficie, desmonte)
+    dist_retorno_desde_mineral: List[str] = field(default_factory=list)   # Cancha mineral -> Bocamina (superficie, vacío)
+    dist_retorno_desde_desmonte: List[str] = field(default_factory=list)  # Desmontera -> Bocamina (superficie, vacío)
     # Nombres de estación/cola (opcionales, autogenerados si están vacíos)
     facility_name: str = ""
     queue_name: str = ""
-    # Override opcional de potencia HP del scooptram de esta zona (para módulo ABET)
-    hp_scoop: Optional[float] = None
+    # Parámetros ABET por zona/circuito
+    hp_scoop: Optional[float] = None                 # Override opcional de potencia HP del scooptram de esta zona
+    cap_max_ventilacion_m3_min: float = 0.0          # Tope de caudal de ventilación del circuito/zona (0 = sin tope)
 
     def __post_init__(self) -> None:
         self.zone_id = self.zone_id.strip().upper()
@@ -291,6 +303,7 @@ class ZoneConfig:
         self.dist_hacia_desmontera = _normalize_route_chain(self.dist_hacia_desmontera)
         self.dist_retorno_desde_mineral = _normalize_route_chain(self.dist_retorno_desde_mineral)
         self.dist_retorno_desde_desmonte = _normalize_route_chain(self.dist_retorno_desde_desmonte)
+        self.cap_max_ventilacion_m3_min = max(0.0, float(self.cap_max_ventilacion_m3_min or 0.0))
         if not self.facility_name:
             self.facility_name = f"SCOOP_{self.zone_id}"
         if not self.queue_name:
@@ -328,7 +341,7 @@ class GlobalConfig:
     capacidad_volquete_tn: float = 25.0
     politica_despacho: str = "DIN_ETA_RITMO"    # FIJA, DIN_ETA_RITMO, DIN_ETA_ESPERA, DIN_TIEMPO_TOTAL, DIN_REACTIVA
     modo_parada: str = "HARD"                   # HARD (corte exacto) o SOFT (termina ciclo)
-    avoid_down_zones: bool = True
+    avoid_down_zones: bool = True               # Internalizado siempre en True (desvío obligatorio ante fallas)
     semilla: int = 25
     num_replicas: int = 30
     nivel_confianza: float = 0.95
@@ -347,9 +360,7 @@ class GlobalConfig:
     costo_cola_volquete_hr: float = 30.0        # US$/h  — solo horas en cola/standby de volquete
     costo_op_scoop_hr: float = 160.0            # US$/HM — solo horas cargando de scooptram
     costo_improd_scoop_hr: float = 90.0         # US$/h  — solo horas en standby esperando volquete
-    costo_desmonte_tn: float = 0.0              # US$/t extra opcional en botadero
-    costo_marginal_volquete_gdia: float = 0.0   # US$/gdia fijo extra opcional por volquete
-    usar_tope_planta: bool = False              # True = tope discreto de capacidad de planta remunerada
+    usar_tope_planta: bool = False              # True = tope exacto de capacidad de planta remunerada
     cap_planta_tn: float = 0.0                  # <= 0 usa meta_mineral_gdia como respaldo
 
     # Rango Sim-Opt (usado por optimizador.py)
@@ -359,21 +370,22 @@ class GlobalConfig:
 
     # Parámetros ABET: Ventilación (D.S. 023-2017-EM) y Emisiones (IPCC/MINAM)
     hp_volquete: float = 400.0
-    dm_volquete: float = 0.85
+    dm_volquete: float = 0.933                  # Disponibilidad mecánica de flota (93.33%); NO descuenta caudal pico
     hp_scoop: float = 250.0
-    dm_scoop: float = 0.85
-    factor_vent_m3_min_hp: float = 3.0
-    cap_max_ventilacion_m3_min: float = 0.0     # 0 = sin alerta de tope
-    diesel_ralenti_l_hr: float = 3.5
-    precio_diesel_usd_l: float = 1.20
-    factor_co2_kg_l: float = 2.68
+    dm_scoop: float = 0.85                      # Disponibilidad mecánica de scooptram; NO descuenta caudal pico
+    factor_vent_m3_min_hp: float = 3.0          # D.S. 023-2017-EM (m3/min por HP)
+    diesel_ralenti_l_hr: float = 3.5            # Consumo ralentí en cola de volquetes (L/h)
+    precio_diesel_usd_l: float = 1.20           # Precio de diésel (US$/L)
+    factor_co2_kg_l: float = 2.68               # Factor de emisión IPCC / MINAM (kg CO2/L)
 
     def __post_init__(self) -> None:
         self.politica_despacho = normalize_policy(self.politica_despacho)
+        # Garantía incondicional: las políticas dinámicas siempre evitan zonas completamente caídas
+        self.avoid_down_zones = True
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "GlobalConfig":
-        """Construye GlobalConfig ignorando limpiamente claves antiguas (ej. esquema_costos)."""
+        """Construye GlobalConfig ignorando limpiamente claves obsoletas de versiones previas."""
         valid_fields = cls.__dataclass_fields__.keys()
         filtered = {k: v for k, v in data.items() if k in valid_fields}
         return cls(**filtered)
@@ -522,6 +534,7 @@ class SubHaulDESEngine:
         # _legacy_kwargs ignora limpiamente parámetros obsoletos (ej. costo_op_volquete_hora)
         self.config = config
         self.g = config.global_cfg
+        self.g.avoid_down_zones = True
         self.policy = normalize_policy(self.g.politica_despacho)
         self.g.politica_despacho = self.policy
 
@@ -548,6 +561,11 @@ class SubHaulDESEngine:
             raise ValueError("Debe existir al menos una zona activa para ejecutar la simulación.")
         self.zone_map: Dict[str, ZoneConfig] = {z.zone_id: z for z in self.active_zones}
 
+        # Sincronización automática de la meta diaria con la suma de cuotas activas por zona
+        active_quota_sum = sum(float(z.quota_mineral_tn) for z in self.active_zones)
+        if active_quota_sum > 0.0:
+            self.g.meta_mineral_gdia = active_quota_sum
+
         # Estaciones: 1 por zona activa + balanza (si num_balanzas > 0) + descargas (si cap > 0)
         self.stations: Dict[str, StationMonitor] = {}
         for z in self.active_zones:
@@ -568,6 +586,13 @@ class SubHaulDESEngine:
                 self.env, fac_name="DESMONTERA", queue_name="Q_DUMP_WASTE", capacity=self.g.cap_descarga_desmonte
             )
 
+        # Rastreo continuo de volquetes efectivamente dentro de interior mina por zona
+        # (únicamente: dist_bajada_vacio + cola en cámara + dist_carguio + dist_subida_cargado)
+        self.underground_trucks_current: Dict[str, int] = {z.zone_id: 0 for z in self.active_zones}
+        self.underground_trucks_max: Dict[str, int] = {z.zone_id: 0 for z in self.active_zones}
+        self.underground_trucks_area_sec: Dict[str, float] = {z.zone_id: 0.0 for z in self.active_zones}
+        self.underground_trucks_last_change: Dict[str, float] = {z.zone_id: 0.0 for z in self.active_zones}
+
         # Acumuladores de producción y métricas de ciclo
         self.ore_by_zone: Dict[str, float] = {z.zone_id: 0.0 for z in self.active_zones}
         self.waste_by_zone: Dict[str, float] = {z.zone_id: 0.0 for z in self.active_zones}
@@ -583,7 +608,7 @@ class SubHaulDESEngine:
         self.total_truck_wait_sec: float = 0.0
         self.n_trucks_total: int = sum(z.n_trucks for z in self.active_zones)
 
-        # Tope configurable de capacidad de planta remunerada (corte discreto viaje por viaje)
+        # Tope configurable de capacidad de planta remunerada (corte exacto en viaje de cruce)
         self.effective_plant_cap_tn: float = (
             float(self.g.cap_planta_tn) if float(self.g.cap_planta_tn) > 0 else float(self.g.meta_mineral_gdia)
         )
@@ -602,6 +627,26 @@ class SubHaulDESEngine:
         self.in_flight_etas: Dict[str, List[Tuple[float, int]]] = {z.zone_id: [] for z in self.active_zones}
         self.active_assigned_trucks: Dict[str, int] = {z.zone_id: 0 for z in self.active_zones}
         self._precompute_expected_times()
+
+    # --------------------------------------------------------------------------
+    # Monitoreo continuo de ocupación en interior mina por zona (D.S. 023-2017-EM)
+    # --------------------------------------------------------------------------
+    def _update_underground_area(self, zid: str, now: Optional[float] = None) -> None:
+        t = self.env.now if now is None else now
+        self.underground_trucks_area_sec[zid] += (
+            self.underground_trucks_current[zid] * (t - self.underground_trucks_last_change[zid])
+        )
+        self.underground_trucks_last_change[zid] = t
+
+    def _enter_underground(self, zid: str) -> None:
+        self._update_underground_area(zid)
+        self.underground_trucks_current[zid] += 1
+        if self.underground_trucks_current[zid] > self.underground_trucks_max[zid]:
+            self.underground_trucks_max[zid] = self.underground_trucks_current[zid]
+
+    def _exit_underground(self, zid: str) -> None:
+        self._update_underground_area(zid)
+        self.underground_trucks_current[zid] = max(0, self.underground_trucks_current[zid] - 1)
 
     # --------------------------------------------------------------------------
     # Valores esperados analíticos (para ETA y cuota proyectada en despacho)
@@ -861,8 +906,8 @@ class SubHaulDESEngine:
         """
         Decisión reactiva evaluada tras descargar (en cancha o desmontera):
         - FIJA: retorna siempre current_zone (B = A).
-        - DIN_REACTIVA: elige zona B usando únicamente colas instantáneas y cuotas
-          descargadas (sin ETA, sin camiones en tránsito y sin vínculo con la zona A).
+        - DIN_REACTIVA: evita incondicionalmente zonas caídas (con fallback solo si
+          todas caen) y elige zona B usando colas instantáneas y cuotas descargadas.
         """
         if self.policy == "FIJA":
             if current_zone is None:
@@ -870,10 +915,12 @@ class SubHaulDESEngine:
             return current_zone
 
         candidates = list(self.active_zones)
-        if self.g.avoid_down_zones:
-            operational = [z for z in candidates if not self.stations[z.zone_id].is_fully_down()]
-            if operational:
-                candidates = operational
+
+        # Filtro 1 incondicional de resiliencia: evitar zonas completamente detenidas
+        operational = [z for z in candidates if not self.stations[z.zone_id].is_fully_down()]
+        if operational:
+            candidates = operational
+
         under_max = [
             z for z in candidates
             if z.max_quota_mineral_tn <= 0.0 or self.ore_by_zone[z.zone_id] < z.max_quota_mineral_tn
@@ -901,18 +948,17 @@ class SubHaulDESEngine:
         """
         Decisión predictiva ejecutada inmediatamente después de descargar (en cancha o desmontera),
         totalmente desvinculada de la zona de origen A.
-        Todas las variantes utilizan cuota proyectada (descargado + en tránsito) y evitan zonas caídas:
+        Todas las variantes evitan incondicionalmente zonas caídas y usan cuota proyectada:
         - DIN_ETA_RITMO    : Ritmo horario de cuota -> menor espera al llegar (ETA) -> menor viaje.
         - DIN_ETA_ESPERA   : Menor espera al llegar (ETA) -> menor % cuota proyectada -> menor viaje.
         - DIN_TIEMPO_TOTAL : Menor tiempo total estimado (t_viaje + t_cola proyectado).
         """
         candidates = list(self.active_zones)
 
-        # 1. Evitar zonas completamente detenidas por falla mecánica
-        if self.g.avoid_down_zones:
-            operational = [z for z in candidates if not self.stations[z.zone_id].is_fully_down()]
-            if operational:
-                candidates = operational
+        # 1. Filtro 1 incondicional de resiliencia: evitar zonas completamente detenidas por falla
+        operational = [z for z in candidates if not self.stations[z.zone_id].is_fully_down()]
+        if operational:
+            candidates = operational
 
         # 2. Respetar tope máximo de extracción si está configurado (> 0)
         under_max = [
@@ -983,7 +1029,7 @@ class SubHaulDESEngine:
             self.in_flight_etas[current_zone_id].append(my_eta_entry)
             self.active_assigned_trucks[current_zone_id] += 1
 
-        # 1. Traslado inicial: Estacionamiento -> Bocamina[A]
+        # 1. Traslado inicial (superficie): Estacionamiento -> Bocamina[A]
         yield from self.travel_segments(
             self.zone_map[current_zone_id].dist_inicial,
             zone_for_prod=current_zone_id,
@@ -999,8 +1045,10 @@ class SubHaulDESEngine:
         while self.env.now < self.sim_time:
             z = self.zone_map[current_zone_id]
 
-            # --- IDA (vinculada a zona origen A) ---
-            # Bocamina[A] -> Cámara de carguío[A] (vacío)
+            # --- INGRESO A INTERIOR MINA (Bocamina[A] -> Cámara[A] -> Bocamina[A]) ---
+            self._enter_underground(z.zone_id)
+
+            # Bocamina[A] -> Cámara de carguío[A] (vacío, interior mina)
             yield from self.travel_segments(
                 z.dist_bajada_vacio,
                 zone_for_prod=z.zone_id,
@@ -1018,7 +1066,7 @@ class SubHaulDESEngine:
                     self.in_flight_etas[z.zone_id].remove(my_eta_entry)
                 my_eta_entry = None
 
-            # Cola y Carguío en cámara[A]
+            # Cola y Carguío en cámara[A] (interior mina)
             yield from self.use_station(
                 z.zone_id, truck_id, z.dist_carguio, zone_for_wait=z.zone_id, load_state="EMPTY"
             )
@@ -1027,7 +1075,7 @@ class SubHaulDESEngine:
             is_mineral = (self.rng.random() <= z.prob_mineral)
             mat_state = "ORE" if is_mineral else "WASTE"
 
-            # Cámara de carguío[A] -> Bocamina[A] (cargado)
+            # Cámara de carguío[A] -> Bocamina[A] (cargado, interior mina)
             yield from self.travel_segments(
                 z.dist_subida_cargado,
                 zone_for_prod=z.zone_id,
@@ -1039,8 +1087,11 @@ class SubHaulDESEngine:
                 prev_zone_id=z.zone_id,
             )
 
+            # --- SALIDA DE INTERIOR MINA HACIA SUPERFICIE (Bocamina[A]) ---
+            self._exit_underground(z.zone_id)
+
             if is_mineral:
-                # Bocamina[A] -> Balanza -> Cancha de mineral -> Descarga mineral
+                # Bocamina[A] -> Balanza -> Cancha de mineral -> Descarga mineral (superficie)
                 yield from self.travel_segments(
                     z.dist_hacia_balanza,
                     zone_for_prod=z.zone_id,
@@ -1086,6 +1137,16 @@ class SubHaulDESEngine:
 
                 ore_dist = z.ore_tonnage_dist or self.g.dist_tonelaje_mineral
                 ton = self.sample_ref(ore_dist)
+
+                # Corte exacto en el tope de planta con NSR de la zona de origen del viaje
+                if self.effective_plant_cap_tn > 0.0:
+                    rem_cap = max(0.0, self.effective_plant_cap_tn - self.capped_ore_tn)
+                    if rem_cap > 0.0:
+                        paid_ton = min(ton, rem_cap)
+                        self.capped_ore_tn += paid_ton
+                        self.capped_gross_revenue_usd += paid_ton * z.ore_price_usd_tn
+
+                # Producción física total acumulada en toda la guardia
                 self.ore_by_zone[z.zone_id] += ton
                 if (
                     self.time_to_target_sec is None
@@ -1094,9 +1155,6 @@ class SubHaulDESEngine:
                 ):
                     self.time_to_target_sec = float(self.env.now)
                 self.trips_ore_by_zone[z.zone_id] += 1
-                if self.effective_plant_cap_tn > 0 and self.capped_ore_tn < self.effective_plant_cap_tn:
-                    self.capped_ore_tn += ton
-                    self.capped_gross_revenue_usd += ton * z.ore_price_usd_tn
                 if self.record_trace:
                     self.trace["dumps"].append({
                         "t": round(self.env.now, 2),
@@ -1107,7 +1165,7 @@ class SubHaulDESEngine:
                         "dump_duration_sec": round(dump_svc_sec, 2),
                     })
             else:
-                # Bocamina[A] -> Desmontera -> Descarga desmonte
+                # Bocamina[A] -> Desmontera -> Descarga desmonte (superficie)
                 yield from self.travel_segments(
                     z.dist_hacia_desmontera,
                     zone_for_prod=z.zone_id,
@@ -1175,7 +1233,7 @@ class SubHaulDESEngine:
                     "dump_point": "CANCHA_MIN" if is_mineral else "DESMONTERA",
                 })
 
-            # --- RETORNO (vinculado EXCLUSIVAMENTE a la zona destino B) ---
+            # --- RETORNO EN SUPERFICIE (vinculado EXCLUSIVAMENTE a la zona destino B) ---
             next_z = self.zone_map[next_zone_id]
             if is_mineral:
                 yield from self.travel_segments(
@@ -1242,6 +1300,9 @@ class SubHaulDESEngine:
         for st in self.stations.values():
             st.finalize_at_horizon(self.effective_horizon)
 
+        for z in self.active_zones:
+            self._update_underground_area(z.zone_id, self.effective_horizon)
+
         return self.get_summary_kpis()
 
     # --------------------------------------------------------------------------
@@ -1287,6 +1348,8 @@ class SubHaulDESEngine:
                 "unit_cost_usd_tn": float(kpis["unit_cost_usd_tn"]),
                 "total_truck_wait_hr": float(kpis["total_truck_wait_hr"]),
                 "truck_fu": float(kpis["truck_fu"]),
+                "vent_q_peak_total_m3_min": float(kpis["vent_q_peak_total_m3_min"]),
+                "vent_q_peak_total_cfm": float(kpis["vent_q_peak_total_cfm"]),
             },
             "travels": self.trace["travels"],
             "stations": self.trace["stations"],
@@ -1296,7 +1359,7 @@ class SubHaulDESEngine:
         }
 
     # --------------------------------------------------------------------------
-    # Reportes y KPIs estructurados (Estaciones + Económicos + Entrada para ABET)
+    # Reportes y KPIs estructurados (Estaciones + Económicos + ABET)
     # --------------------------------------------------------------------------
     def _ordered_station_keys(self) -> List[str]:
         keys = [z.zone_id for z in self.active_zones]
@@ -1350,6 +1413,11 @@ class SubHaulDESEngine:
 
     def get_stations_report_dataframe(self) -> pd.DataFrame:
         """Reporte unificado de estaciones, colas y demoras de superficie por zona."""
+        surface_labels = {
+            "BAL": "Balanza",
+            "DUMP_ORE": "Cancha Mineral",
+            "DUMP_WASTE": "Desmontera",
+        }
         rows = []
         for key in self._ordered_station_keys():
             st = self.stations[key]
@@ -1367,7 +1435,7 @@ class SubHaulDESEngine:
             ave_wait_nonzero = float(np.mean(non_zero)) if non_zero else 0.0
 
             if is_zone:
-                estacion_lbl = f"{st.fac_name} ({self.zone_map[key].zone_name})"
+                estacion_lbl = f"Scooptram ({self.zone_map[key].zone_name})"
                 sc_cnt = self.zone_scale_cnt[key]
                 ore_cnt = self.zone_dump_ore_cnt[key]
                 wst_cnt = self.zone_dump_waste_cnt[key]
@@ -1388,7 +1456,7 @@ class SubHaulDESEngine:
                     else 0.0
                 )
             else:
-                estacion_lbl = st.fac_name
+                estacion_lbl = surface_labels.get(key, st.fac_name)
                 t_balanza = None
                 t_desc_min = None
                 t_desc_desm = None
@@ -1437,8 +1505,6 @@ class SubHaulDESEngine:
         tot_scoop_idle = 0.0
         tot_truck_op = 0.0
         tot_truck_wait = 0.0
-        tot_waste_extra = 0.0
-        tot_marginal_fleet = 0.0
         tot_opex = 0.0
 
         for z in self.active_zones:
@@ -1461,10 +1527,7 @@ class SubHaulDESEngine:
             c_truck_op = (self.zone_truck_prod_sec[z.zone_id] / 3600.0) * self.g.costo_op_volquete_hr
             c_truck_wait = (self.zone_truck_wait_sec[z.zone_id] / 3600.0) * self.g.costo_cola_volquete_hr
 
-            c_waste = waste_tn * self.g.costo_desmonte_tn
-            c_fleet = z.n_trucks * self.g.costo_marginal_volquete_gdia
-
-            c_total = c_scoop_op + c_scoop_idle + c_truck_op + c_truck_wait + c_waste + c_fleet
+            c_total = c_scoop_op + c_scoop_idle + c_truck_op + c_truck_wait
             net = rev - c_total
 
             tot_trucks += z.n_trucks
@@ -1475,8 +1538,6 @@ class SubHaulDESEngine:
             tot_scoop_idle += c_scoop_idle
             tot_truck_op += c_truck_op
             tot_truck_wait += c_truck_wait
-            tot_waste_extra += c_waste
-            tot_marginal_fleet += c_fleet
             tot_opex += c_total
 
             row: Dict[str, object] = {
@@ -1489,8 +1550,6 @@ class SubHaulDESEngine:
                 "Costo Standby Scoop (US$)": round(c_scoop_idle, 2),
                 "Costo Op. Volq. (US$)": round(c_truck_op, 2),
                 "Costo Cola Volq. (US$)": round(c_truck_wait, 2),
-                "Costo Desmonte (US$)": round(c_waste, 2),
-                "Costo Marginal Flota (US$)": round(c_fleet, 2),
                 "Costo Total (US$)": round(c_total, 2),
                 "Ingreso Neto (US$)": round(net, 2),
             }
@@ -1511,8 +1570,6 @@ class SubHaulDESEngine:
             "Costo Standby Scoop (US$)": round(tot_scoop_idle, 2),
             "Costo Op. Volq. (US$)": round(tot_truck_op, 2),
             "Costo Cola Volq. (US$)": round(tot_truck_wait, 2),
-            "Costo Desmonte (US$)": round(tot_waste_extra, 2),
-            "Costo Marginal Flota (US$)": round(tot_marginal_fleet, 2),
             "Costo Total (US$)": round(tot_opex, 2),
             "Ingreso Neto (US$)": round(tot_net_eff, 2),
         }
@@ -1527,7 +1584,7 @@ class SubHaulDESEngine:
         return self.get_economic_dataframe(include_extended_costs=include_extended_costs)
 
     def get_summary_kpis(self) -> Dict[str, object]:
-        """Diccionario consolidado de KPIs para el optimizador y Streamlit."""
+        """Diccionario consolidado de KPIs productivos, económicos, ventilación D.S. 023 y CO2."""
         T_real_horas = self.effective_horizon / 3600.0
         ore_total = sum(self.ore_by_zone.values())
         waste_total = sum(self.waste_by_zone.values())
@@ -1557,23 +1614,13 @@ class SubHaulDESEngine:
         # 2. Volquetes: partición exclusiva productivo (HM) vs. cola/standby
         truck_prod_sec = sum(self.zone_truck_prod_sec.values())
         truck_wait_sec = sum(self.zone_truck_wait_sec.values())
+        truck_wait_hr = truck_wait_sec / 3600.0
         truck_op_cost = (truck_prod_sec / 3600.0) * self.g.costo_op_volquete_hr
-        truck_wait_cost = (truck_wait_sec / 3600.0) * self.g.costo_cola_volquete_hr
+        truck_wait_cost = truck_wait_hr * self.g.costo_cola_volquete_hr
         fleet_op_cost = truck_op_cost + truck_wait_cost
 
-        # 3. Opcionales (0.0 por defecto)
-        waste_extra_cost = waste_total * self.g.costo_desmonte_tn
-        marginal_fleet_cost = self.n_trucks_total * self.g.costo_marginal_volquete_gdia
-
-        # 4. OPEX Total, Ingreso Neto y Costo Unitario
-        total_opex = (
-            scoop_op_cost
-            + scoop_idle_cost
-            + truck_op_cost
-            + truck_wait_cost
-            + waste_extra_cost
-            + marginal_fleet_cost
-        )
+        # 3. OPEX Total, Ingreso Neto y Costo Unitario
+        total_opex = scoop_op_cost + scoop_idle_cost + truck_op_cost + truck_wait_cost
         uncapped_net_revenue_usd = uncapped_gross_revenue_usd - total_opex
         capped_gross = self.capped_gross_revenue_usd
         capped_net = capped_gross - total_opex
@@ -1603,6 +1650,63 @@ class SubHaulDESEngine:
             avg_wait_nonzero_sec[k] = float(np.mean(nz)) if nz else 0.0
             zero_wait_pct[k] = (st.q_zero_entries / st.q_entries * 100.0) if st.q_entries > 0 else 100.0
 
+        # 4. Ventilación normativa D.S. 023-2017-EM por pico simultáneo local en interior mina
+        #    Q_pico,zona = factor_vent * (N_scoop,zona * HP_scoop,zona + N_volq_int_max,zona * HP_volq)
+        #    (Fu = 1.0, sin promediar en la guardia y sin aplicar Dm como factor reductor)
+        f_vent = float(self.g.factor_vent_m3_min_hp)
+        hp_volq = float(self.g.hp_volquete)
+
+        underground_trucks_peak_by_zone: Dict[str, int] = {}
+        underground_trucks_avg_by_zone: Dict[str, float] = {}
+        vent_q_peak_m3_min_by_zone: Dict[str, float] = {}
+        vent_q_peak_cfm_by_zone: Dict[str, float] = {}
+        vent_cap_max_m3_min_by_zone: Dict[str, float] = {}
+        vent_cap_usage_pct_by_zone: Dict[str, float] = {}
+        vent_margin_m3_min_by_zone: Dict[str, Optional[float]] = {}
+        vent_alert_by_zone: Dict[str, bool] = {}
+
+        for z in self.active_zones:
+            zid = z.zone_id
+            hp_sc = float(z.hp_scoop) if z.hp_scoop is not None else float(self.g.hp_scoop)
+            peak_volq = int(self.underground_trucks_max[zid])
+            avg_volq = (
+                self.underground_trucks_area_sec[zid] / self.effective_horizon
+                if self.effective_horizon > 0.0
+                else 0.0
+            )
+            q_peak_m3 = f_vent * (int(z.n_scoops) * hp_sc + peak_volq * hp_volq)
+            q_peak_cfm = q_peak_m3 * M3_MIN_TO_CFM
+
+            underground_trucks_peak_by_zone[zid] = peak_volq
+            underground_trucks_avg_by_zone[zid] = round(avg_volq, 4)
+            vent_q_peak_m3_min_by_zone[zid] = round(q_peak_m3, 2)
+            vent_q_peak_cfm_by_zone[zid] = round(q_peak_cfm, 1)
+
+            cap_z = float(z.cap_max_ventilacion_m3_min)
+            vent_cap_max_m3_min_by_zone[zid] = round(cap_z, 2)
+            if cap_z > 0.0:
+                vent_cap_usage_pct_by_zone[zid] = round((q_peak_m3 / cap_z) * 100.0, 2)
+                vent_margin_m3_min_by_zone[zid] = round(cap_z - q_peak_m3, 2)
+                vent_alert_by_zone[zid] = bool(q_peak_m3 > cap_z)
+            else:
+                vent_cap_usage_pct_by_zone[zid] = 0.0
+                vent_margin_m3_min_by_zone[zid] = None
+                vent_alert_by_zone[zid] = False
+
+        vent_q_peak_total_m3_min = sum(vent_q_peak_m3_min_by_zone.values())
+        vent_q_peak_total_cfm = vent_q_peak_total_m3_min * M3_MIN_TO_CFM
+        vent_any_alert = any(vent_alert_by_zone.values())
+
+        # 5. Combustible desperdiciado y CO2 en colas (EXCLUSIVAMENTE horas en cola de volquetes;
+        #    excluye completamente tiempo idle/standby de scooptrams)
+        guardias_anio = int(self.g.guardias_anio)
+        diesel_wasted_wait_l_shift = truck_wait_hr * float(self.g.diesel_ralenti_l_hr)
+        diesel_wasted_wait_l_year = diesel_wasted_wait_l_shift * guardias_anio
+        diesel_wasted_wait_cost_usd_shift = diesel_wasted_wait_l_shift * float(self.g.precio_diesel_usd_l)
+        diesel_wasted_wait_cost_usd_year = diesel_wasted_wait_cost_usd_shift * guardias_anio
+        co2_wasted_wait_kg_shift = diesel_wasted_wait_l_shift * float(self.g.factor_co2_kg_l)
+        co2_wasted_wait_t_year = (co2_wasted_wait_kg_shift * guardias_anio) / 1000.0
+
         return {
             "seed": self.seed,
             "policy": self.policy,
@@ -1611,6 +1715,7 @@ class SubHaulDESEngine:
             "effective_horizon_sec": self.effective_horizon,
             "T_real_horas": round(T_real_horas, 4),
             "n_trucks_total": self.n_trucks_total,
+            "dm_volquete": round(float(self.g.dm_volquete), 4),
             "assignment": {z.zone_id: z.n_trucks for z in self.active_zones},
             "ore_total_tn": round(ore_total, 4),
             "capped_ore_tn": round(self.capped_ore_tn, 4),
@@ -1627,19 +1732,13 @@ class SubHaulDESEngine:
             "truck_op_cost_usd": round(truck_op_cost, 2),
             "truck_wait_cost_usd": round(truck_wait_cost, 2),
             "fleet_op_cost_usd": round(fleet_op_cost, 2),
-            "waste_extra_cost_usd": round(waste_extra_cost, 2),
-            "marginal_fleet_cost_usd": round(marginal_fleet_cost, 2),
-            # Aliases temporales para compatibilidad con optimizador.py/app.py antes de Pasos 2-3
-            "costo_operativo_flota": round(fleet_op_cost, 2),
-            "waste_cost_usd": round(waste_extra_cost, 2),
-            "fleet_marginal_cost_usd": round(marginal_fleet_cost, 2),
             "total_opex_usd": round(total_opex, 2),
             "net_revenue_usd": round(net_revenue, 2),
             "capped_net_revenue_usd": round(capped_net, 2),
             "uncapped_net_revenue_usd": round(uncapped_net_revenue_usd, 2),
             "unit_cost_usd_tn": round(unit_cost, 4),
             "total_truck_prod_hr": round(truck_prod_sec / 3600.0, 4),
-            "total_truck_wait_hr": round(truck_wait_sec / 3600.0, 4),
+            "total_truck_wait_hr": round(truck_wait_hr, 4),
             "wait_hr_by_zone": {k: round(v / 3600.0, 4) for k, v in self.zone_truck_wait_sec.items()},
             "scale_wait_hr": round(self.scale_wait_sec / 3600.0, 4),
             "scoop_utilization_by_zone": {k: round(v, 4) for k, v in scoop_util_by_zone.items()},
@@ -1649,6 +1748,25 @@ class SubHaulDESEngine:
             "max_queue_by_station": max_queue_by_station,
             "avg_wait_nonzero_sec_by_station": {k: round(v, 2) for k, v in avg_wait_nonzero_sec.items()},
             "zero_wait_pct_by_station": {k: round(v, 2) for k, v in zero_wait_pct.items()},
+            # Ventilación normativa D.S. 023-2017-EM (pico simultáneo interior mina por zona)
+            "underground_trucks_peak_by_zone": underground_trucks_peak_by_zone,
+            "underground_trucks_avg_by_zone": underground_trucks_avg_by_zone,
+            "vent_q_peak_m3_min_by_zone": vent_q_peak_m3_min_by_zone,
+            "vent_q_peak_cfm_by_zone": vent_q_peak_cfm_by_zone,
+            "vent_q_peak_total_m3_min": round(vent_q_peak_total_m3_min, 2),
+            "vent_q_peak_total_cfm": round(vent_q_peak_total_cfm, 1),
+            "vent_cap_max_m3_min_by_zone": vent_cap_max_m3_min_by_zone,
+            "vent_cap_usage_pct_by_zone": vent_cap_usage_pct_by_zone,
+            "vent_margin_m3_min_by_zone": vent_margin_m3_min_by_zone,
+            "vent_alert_by_zone": vent_alert_by_zone,
+            "vent_any_alert": vent_any_alert,
+            # Combustible desperdiciado y CO2 en colas de volquetes (guardia y año)
+            "diesel_wasted_wait_l_shift": round(diesel_wasted_wait_l_shift, 2),
+            "diesel_wasted_wait_l_year": round(diesel_wasted_wait_l_year, 1),
+            "diesel_wasted_wait_cost_usd_shift": round(diesel_wasted_wait_cost_usd_shift, 2),
+            "diesel_wasted_wait_cost_usd_year": round(diesel_wasted_wait_cost_usd_year, 2),
+            "co2_wasted_wait_kg_shift": round(co2_wasted_wait_kg_shift, 2),
+            "co2_wasted_wait_t_year": round(co2_wasted_wait_t_year, 3),
         }
 
 
@@ -1762,12 +1880,13 @@ def build_huancapeti_base_config(
 
     global_cfg = GlobalConfig(
         sim_time_sec=32400.0,
-        meta_mineral_gdia=1500.0,
+        meta_mineral_gdia=sum(float(z.quota_mineral_tn) for z in zones if z.active),
         guardias_anio=730,
         capacidad_volquete_tn=25.0,
         politica_despacho=normalize_policy(policy),
         modo_parada=stop_mode,
         semilla=seed,
+        dm_volquete=0.933,
     )
 
     return SimulationConfig(global_cfg=global_cfg, zones=zones, distributions=distributions, breakdowns=[])
@@ -1826,7 +1945,7 @@ def export_excel_template(
     # Hoja 1: Parámetros Globales
     global_rows = [
         ("sim_time_sec", g.sim_time_sec, "s", "Duración efectiva de guardia (ej. 32400 = 9 h)"),
-        ("meta_mineral_gdia", g.meta_mineral_gdia, "t/gdia", "Meta de extracción de mineral por guardia"),
+        ("meta_mineral_gdia", g.meta_mineral_gdia, "t/gdia", "Meta de extracción de mineral por guardia (suma de cuotas activas)"),
         ("guardias_anio", g.guardias_anio, "gdia/año", "Guardias operativas por año"),
         ("capacidad_volquete_tn", g.capacidad_volquete_tn, "t", "Capacidad nominal del volquete"),
         (
@@ -1836,7 +1955,6 @@ def export_excel_template(
             "DIN_ETA_RITMO | DIN_ETA_ESPERA | DIN_TIEMPO_TOTAL | DIN_REACTIVA | FIJA",
         ),
         ("modo_parada", g.modo_parada, "texto", "HARD (corte exacto) | SOFT (culmina descarga en tránsito)"),
-        ("avoid_down_zones", g.avoid_down_zones, "bool", "Evitar zonas con scooptram en falla al despachar"),
         ("semilla", g.semilla, "entero", "Semilla aleatoria Mersenne Twister"),
         ("num_replicas", g.num_replicas, "entero", "Réplicas de Montecarlo para IC y pruebas de hipótesis"),
         ("nivel_confianza", g.nivel_confianza, "frac", "Nivel de confianza estadística (ej. 0.95)"),
@@ -1851,24 +1969,23 @@ def export_excel_template(
         ("costo_cola_volquete_hr", g.costo_cola_volquete_hr, "US$/h", "Tarifa standby/cola por hora de volquete"),
         ("costo_op_scoop_hr", g.costo_op_scoop_hr, "US$/HM", "Tarifa operativa por hora cargando de scooptram"),
         ("costo_improd_scoop_hr", g.costo_improd_scoop_hr, "US$/h", "Tarifa standby por hora de scooptram esperando volquete"),
-        ("costo_desmonte_tn", g.costo_desmonte_tn, "US$/t", "Costo operativo extra opcional por tonelada de desmonte"),
-        ("costo_marginal_volquete_gdia", g.costo_marginal_volquete_gdia, "US$/gdia", "Costo fijo extra opcional por volquete/guardia"),
+        ("usar_tope_planta", g.usar_tope_planta, "bool", "Aplicar tope exacto de capacidad de planta remunerada"),
+        ("cap_planta_tn", g.cap_planta_tn, "t/gdia", "Capacidad de planta remunerada (0 = usa meta_mineral_gdia)"),
         ("flota_min", g.flota_min, "und", "Límite inferior de búsqueda de flota (Sim-Opt)"),
         ("flota_max", g.flota_max, "und", "Límite superior de búsqueda de flota (Sim-Opt)"),
         ("funcion_objetivo", g.funcion_objetivo, "texto", "INGRESO_NETO | TONELAJE | COSTO_UNITARIO"),
         ("hp_volquete", g.hp_volquete, "HP", "Potencia efectiva de volquete (D.S. 023-2017-EM)"),
-        ("dm_volquete", g.dm_volquete, "frac", "Disponibilidad mecánica de volquete"),
+        ("dm_volquete", g.dm_volquete, "frac", "Disponibilidad mecánica de volquete (solo flota; NO descuenta Q pico)"),
         ("hp_scoop", g.hp_scoop, "HP", "Potencia efectiva de scooptram (D.S. 023-2017-EM)"),
-        ("dm_scoop", g.dm_scoop, "frac", "Disponibilidad mecánica de scooptram"),
+        ("dm_scoop", g.dm_scoop, "frac", "Disponibilidad mecánica de scooptram (NO descuenta Q pico)"),
         ("factor_vent_m3_min_hp", g.factor_vent_m3_min_hp, "m3/min/HP", "Requerimiento normativo (D.S. 023-2017-EM)"),
-        ("cap_max_ventilacion_m3_min", g.cap_max_ventilacion_m3_min, "m3/min", "Capacidad máxima de ventilación de mina (0 = sin tope)"),
-        ("diesel_ralenti_l_hr", g.diesel_ralenti_l_hr, "L/h", "Consumo de diésel en ralentí"),
+        ("diesel_ralenti_l_hr", g.diesel_ralenti_l_hr, "L/h", "Consumo de diésel en ralentí (solo colas de volquetes)"),
         ("precio_diesel_usd_l", g.precio_diesel_usd_l, "US$/L", "Precio del diésel"),
         ("factor_co2_kg_l", g.factor_co2_kg_l, "kgCO2/L", "Factor de emisión IPCC / MINAM"),
     ]
     df_global = pd.DataFrame(global_rows, columns=["parametro", "valor", "unidad", "descripcion"])
 
-    # Hoja 2: Zonas (9 parámetros de ruta anclados en bocamina)
+    # Hoja 2: Zonas (9 parámetros de ruta anclados en bocamina + tope de ventilación por circuito)
     zone_rows = []
     for z in cfg.zones:
         zone_rows.append({
@@ -1897,6 +2014,7 @@ def export_excel_template(
             "facility_name": z.facility_name,
             "queue_name": z.queue_name,
             "hp_scoop": "" if z.hp_scoop is None else z.hp_scoop,
+            "cap_max_ventilacion_m3_min": z.cap_max_ventilacion_m3_min,
         })
     df_zones = pd.DataFrame(zone_rows)
 
@@ -1983,8 +2101,8 @@ def export_excel_template(
 def load_config_from_excel(filepath: Union[str, Path]) -> SimulationConfig:
     """
     Lee una plantilla Excel de SubHaul-Opt y construye un SimulationConfig completo.
-    Ignora limpiamente parámetros obsoletos (como `esquema_costos`) si existen en
-    plantillas antiguas.
+    Ignora limpiamente parámetros obsoletos de versiones previas y sincroniza
+    `meta_mineral_gdia` con la suma de cuotas de zonas activas si esta es > 0.
     """
     xls = pd.ExcelFile(filepath, engine="openpyxl")
 
@@ -1999,7 +2117,7 @@ def load_config_from_excel(filepath: Union[str, Path]) -> SimulationConfig:
         capacidad_volquete_tn=_as_float(g_map.get("capacidad_volquete_tn"), 25.0),
         politica_despacho=normalize_policy(_as_str(g_map.get("politica_despacho"), "DIN_ETA_RITMO")),
         modo_parada=_as_str(g_map.get("modo_parada"), "HARD").upper(),
-        avoid_down_zones=_as_bool(g_map.get("avoid_down_zones"), True),
+        avoid_down_zones=True,
         semilla=_as_int(g_map.get("semilla"), 25),
         num_replicas=_as_int(g_map.get("num_replicas"), 30),
         nivel_confianza=_as_float(g_map.get("nivel_confianza"), 0.95),
@@ -2014,19 +2132,16 @@ def load_config_from_excel(filepath: Union[str, Path]) -> SimulationConfig:
         costo_cola_volquete_hr=_as_float(g_map.get("costo_cola_volquete_hr"), 30.0),
         costo_op_scoop_hr=_as_float(g_map.get("costo_op_scoop_hr"), 160.0),
         costo_improd_scoop_hr=_as_float(g_map.get("costo_improd_scoop_hr"), 90.0),
-        costo_desmonte_tn=_as_float(g_map.get("costo_desmonte_tn"), 0.0),
-        costo_marginal_volquete_gdia=_as_float(g_map.get("costo_marginal_volquete_gdia"), 0.0),
         usar_tope_planta=_as_bool(g_map.get("usar_tope_planta"), False),
         cap_planta_tn=_as_float(g_map.get("cap_planta_tn"), 0.0),
         flota_min=_as_int(g_map.get("flota_min"), 10),
         flota_max=_as_int(g_map.get("flota_max"), 18),
         funcion_objetivo=_as_str(g_map.get("funcion_objetivo"), "INGRESO_NETO").upper(),
         hp_volquete=_as_float(g_map.get("hp_volquete"), 400.0),
-        dm_volquete=_as_float(g_map.get("dm_volquete"), 0.85),
+        dm_volquete=_as_float(g_map.get("dm_volquete"), 0.933),
         hp_scoop=_as_float(g_map.get("hp_scoop"), 250.0),
         dm_scoop=_as_float(g_map.get("dm_scoop"), 0.85),
         factor_vent_m3_min_hp=_as_float(g_map.get("factor_vent_m3_min_hp"), 3.0),
-        cap_max_ventilacion_m3_min=_as_float(g_map.get("cap_max_ventilacion_m3_min"), 0.0),
         diesel_ralenti_l_hr=_as_float(g_map.get("diesel_ralenti_l_hr"), 3.5),
         precio_diesel_usd_l=_as_float(g_map.get("precio_diesel_usd_l"), 1.20),
         factor_co2_kg_l=_as_float(g_map.get("factor_co2_kg_l"), 2.68),
@@ -2107,8 +2222,14 @@ def load_config_from_excel(filepath: Union[str, Path]) -> SimulationConfig:
                 facility_name=_as_str(r.get("facility_name"), ""),
                 queue_name=_as_str(r.get("queue_name"), ""),
                 hp_scoop=hp_val,
+                cap_max_ventilacion_m3_min=_as_float(r.get("cap_max_ventilacion_m3_min"), 0.0),
             )
         )
+
+    # Sincronización automática de la meta diaria con la suma de cuotas de zonas activas
+    active_quota_sum = sum(float(z.quota_mineral_tn) for z in zones if z.active)
+    if active_quota_sum > 0.0:
+        global_cfg.meta_mineral_gdia = active_quota_sum
 
     # 4. Contingencias / Fallas
     breakdowns: List[BreakdownConfig] = []
@@ -2142,7 +2263,7 @@ def load_config_from_excel(filepath: Union[str, Path]) -> SimulationConfig:
 
 
 # ==============================================================================
-# 8. BATERÍA DE AUTOVERIFICACIÓN (FÍSICA + AUDITORÍA DE COSTOS + EXCEL + TRACE)
+# 8. BATERÍA DE AUTOVERIFICACIÓN (FÍSICA + COSTOS + VENTILACIÓN + CO2 + TRACE)
 # ==============================================================================
 if __name__ == "__main__":
     pd.set_option("display.max_columns", None)
@@ -2162,13 +2283,21 @@ if __name__ == "__main__":
     assert aprox > 97.0
 
     print("\n" + "=" * 105)
-    print(" 2. AUDITORÍA ESTRICTA DE TIEMPOS Y COSTOS (6-2-7, DIN_ETA_RITMO, seed=25)")
+    print(" 2. AUDITORÍA ESTRICTA DE TIEMPOS, COSTOS, VENTILACIÓN D.S. 023 Y CO2 (6-2-7, DIN_ETA_RITMO, seed=25)")
     print("=" * 105)
     cfg_aud = build_huancapeti_base_config(n_her=6, n_car=2, n_cot=7, policy="DIN_ETA_RITMO", seed=25)
     eng_aud = SubHaulDESEngine(cfg_aud)
     kpi_aud = eng_aud.run()
     df_econ = eng_aud.get_economic_dataframe()
     print(df_econ.to_string(index=False))
+
+    df_st = eng_aud.get_stations_report_dataframe()
+    assert list(df_st["Estación"])[:3] == [
+        "Scooptram (Hércules)",
+        "Scooptram (Caridad)",
+        "Scooptram (Coturcán)",
+    ], f"Etiquetas de estaciones inesperadas: {list(df_st['Estación'])}"
+    assert "Balanza" in list(df_st["Estación"])
 
     eff_hr = eng_aud.effective_horizon / 3600.0
     print("\n--- Verificación de partición de tiempos (Scooptrams) ---")
@@ -2198,8 +2327,6 @@ if __name__ == "__main__":
         + kpi_aud["scoop_idle_cost_usd"]
         + kpi_aud["truck_op_cost_usd"]
         + kpi_aud["truck_wait_cost_usd"]
-        + kpi_aud["waste_extra_cost_usd"]
-        + kpi_aud["marginal_fleet_cost_usd"]
     )
     print(
         f"\n--- Verificación de costos e ingreso neto ---\n"
@@ -2209,15 +2336,39 @@ if __name__ == "__main__":
     )
     assert abs(sum_partials - kpi_aud["total_opex_usd"]) < 0.02
     assert abs((kpi_aud["gross_revenue_usd"] - kpi_aud["total_opex_usd"]) - kpi_aud["net_revenue_usd"]) < 0.02
+    assert cfg_aud.global_cfg.dm_volquete == 0.933
+    assert cfg_aud.global_cfg.avoid_down_zones is True
 
     tot_row = df_econ.iloc[-1]
     assert abs(float(tot_row["Costo Total (US$)"]) - kpi_aud["total_opex_usd"]) < 0.01
     assert abs(float(tot_row["Ingreso Neto (US$)"]) - kpi_aud["net_revenue_usd"]) < 0.01
     assert abs((kpi_aud["truck_op_cost_usd"] + kpi_aud["truck_wait_cost_usd"]) - kpi_aud["fleet_op_cost_usd"]) < 0.02
-    print("OK: Auditoría de tiempos, costos y paridad de tabla económica aprobada al centavo.")
+
+    # Verificación exacta de Q_pico por zona (Fu=1.0, sin Dm)
+    for z in eng_aud.active_zones:
+        zid = z.zone_id
+        peak = kpi_aud["underground_trucks_peak_by_zone"][zid]
+        expected_q = round(3.0 * (z.n_scoops * 250.0 + peak * 400.0), 2)
+        assert abs(kpi_aud["vent_q_peak_m3_min_by_zone"][zid] - expected_q) < 0.01
+
+    print(
+        f"\n--- Verificación Ventilación D.S. 023-2017-EM (Pico Interior Mina, Fu=1.0, sin Dm) ---\n"
+        f"  Picos volquetes int. : {kpi_aud['underground_trucks_peak_by_zone']}\n"
+        f"  Prom. volquetes int. : {kpi_aud['underground_trucks_avg_by_zone']}\n"
+        f"  Q_pico zona (m3/min) : {kpi_aud['vent_q_peak_m3_min_by_zone']}\n"
+        f"  Q_pico zona (CFM)    : {kpi_aud['vent_q_peak_cfm_by_zone']}\n"
+        f"  Q_total (m3/min)     : {kpi_aud['vent_q_peak_total_m3_min']} ({kpi_aud['vent_q_peak_total_cfm']} CFM)"
+    )
+    print(
+        f"\n--- Verificación Diésel y CO2 en Colas de Volquetes ---\n"
+        f"  Diésel : {kpi_aud['diesel_wasted_wait_l_shift']} L/gdia | {kpi_aud['diesel_wasted_wait_l_year']} L/año\n"
+        f"  Costo  : US$ {kpi_aud['diesel_wasted_wait_cost_usd_shift']}/gdia | US$ {kpi_aud['diesel_wasted_wait_cost_usd_year']}/año\n"
+        f"  CO2    : {kpi_aud['co2_wasted_wait_kg_shift']} kg/gdia | {kpi_aud['co2_wasted_wait_t_year']} t/año"
+    )
+    print("OK: Auditoría de tiempos, costos, ventilación D.S. 023 y CO2 aprobada.")
 
     print("\n" + "=" * 105)
-    print(" 3. IDA Y VUELTA PLANTILLA EXCEL (.xlsx) + TOPE DE PLANTA (24 VOLQ: 6-9-9, FIJA)")
+    print(" 3. IDA Y VUELTA PLANTILLA EXCEL (.xlsx) + TOPE EXACTO DE PLANTA (24 VOLQ: 6-9-9, FIJA)")
     print("=" * 105)
     tpl_path = export_excel_template("plantilla_subhaul_opt_base.xlsx", cfg_aud)
     cfg_reloaded = load_config_from_excel(tpl_path)
@@ -2230,9 +2381,14 @@ if __name__ == "__main__":
     cfg_cap.global_cfg.cap_planta_tn = 1500.0
     kpi_cap = SubHaulDESEngine(cfg_cap).run()
     assert kpi_cap["ore_total_tn"] > 1500.0
-    assert 1500.0 <= kpi_cap["capped_ore_tn"] < 1530.0
+    assert abs(kpi_cap["capped_ore_tn"] - 1500.0) < 1e-6, (
+        f"Tope exacto no respetado: capped_ore_tn={kpi_cap['capped_ore_tn']}"
+    )
     assert abs(kpi_cap["net_revenue_usd"] - (kpi_cap["gross_revenue_usd"] - kpi_cap["total_opex_usd"])) < 0.02
-    print("OK: Excel y tope discreto de planta validados.")
+    print(
+        f"OK: Excel y tope exacto de planta validados "
+        f"(físico={kpi_cap['ore_total_tn']:.2f} t | remunerado={kpi_cap['capped_ore_tn']:.2f} t)."
+    )
 
     print("\n" + "=" * 105)
     print(" 4. PARIDAD DE TRACE (record_trace=True vs False) Y SERIALIZACIÓN JSON")
